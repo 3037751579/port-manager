@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -300,21 +300,102 @@ parse_proto() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# iptables 规则持久化
+#   portman 把自己添加的规则记录在 STATE_FILE，开机时由 systemd 服务调用
+#   `portman restore` 重新应用。只恢复 portman 的规则，不影响 docker/fail2ban 等。
+# ---------------------------------------------------------------------------
+STATE_FILE="/etc/portman/iptables.conf"
+SERVICE_NAME="portman-restore.service"
+SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
+
+# 规则不存在时插入到 INPUT 最前面
+ipt_add() {
+    local cmd=$1; shift
+    $cmd -C INPUT "$@" 2>/dev/null || $cmd -I INPUT "$@" 2>/dev/null
+}
+
+# 默认拒绝前必须的基础规则: 回环、已建立的连接、ICMP。不支持连接状态匹配时返回 1
+ipt_base() {
+    local cmd=$1
+    if [[ $cmd == iptables ]]; then ipt_add "$cmd" -p icmp -j ACCEPT
+    else ipt_add "$cmd" -p ipv6-icmp -j ACCEPT; fi
+    ipt_add "$cmd" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT ||
+        ipt_add "$cmd" -m state --state ESTABLISHED,RELATED -j ACCEPT || return 1
+    ipt_add "$cmd" -i lo -j ACCEPT
+}
+
+state_add() {
+    mkdir -p "${STATE_FILE%/*}"
+    grep -qx "allow $1 $2" "$STATE_FILE" 2>/dev/null || echo "allow $1 $2" >>"$STATE_FILE"
+}
+
+state_del() {
+    [[ -f $STATE_FILE ]] && sed -i "/^allow $1 $2\$/d" "$STATE_FILE"
+}
+
+state_policy() {
+    mkdir -p "${STATE_FILE%/*}"
+    [[ -f $STATE_FILE ]] && sed -i '/^policy /d' "$STATE_FILE"
+    echo "policy $1" >>"$STATE_FILE"
+}
+
+# 开机时重新应用记录的规则 (可重复执行)
+restore_rules() {
+    [[ -f $STATE_FILE ]] || return 0
+    local cmd kw p port policy
+    policy=$(awk '$1 == "policy" { v = $2 } END { print v }' "$STATE_FILE")
+    for cmd in iptables ip6tables; do
+        has $cmd || continue
+        while read -r kw p port; do
+            [[ $kw == allow ]] && ipt_add "$cmd" -p "$p" --dport "${port/-/:}" -j ACCEPT
+        done <"$STATE_FILE"
+        if [[ $policy == DROP ]]; then
+            ipt_base "$cmd" && $cmd -P INPUT DROP
+        elif [[ $policy == ACCEPT ]]; then
+            $cmd -P INPUT ACCEPT
+        fi
+    done
+}
+
+install_restore_service() {
+    if ! has systemctl || [[ ! -d /run/systemd/system ]]; then
+        warn "系统未使用 systemd，规则已生效但重启后会丢失"
+        return 1
+    fi
+    cat >"$SERVICE_FILE" <<EOF
+[Unit]
+Description=portman: restore firewall rules
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$INSTALL_PATH restore
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+}
+
 save_iptables() {
-    if has netfilter-persistent; then
-        netfilter-persistent save >/dev/null 2>&1 && info "iptables 规则已持久化" && return
+    has netfilter-persistent && netfilter-persistent save >/dev/null 2>&1
+    if install_restore_service; then
+        info "规则已保存，重启后自动恢复 (记录在 $STATE_FILE)"
     fi
-    if [[ -f /etc/sysconfig/iptables ]]; then
-        iptables-save >/etc/sysconfig/iptables
-        has ip6tables-save && [[ -f /etc/sysconfig/ip6tables ]] && ip6tables-save >/etc/sysconfig/ip6tables
-        info "iptables 规则已保存到 /etc/sysconfig/iptables"
-    elif [[ -d /etc/iptables ]]; then
-        iptables-save >/etc/iptables/rules.v4
-        has ip6tables-save && ip6tables-save >/etc/iptables/rules.v6
-        info "iptables 规则已保存到 /etc/iptables/"
-    else
-        warn "规则已生效，但重启后会丢失。持久化方法: Debian/Ubuntu 安装 iptables-persistent，CentOS 安装 iptables-services"
-    fi
+}
+
+remove_restore_service() {
+    [[ -f $SERVICE_FILE ]] || return 0
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -346,12 +427,10 @@ open_port() {
                 firewalld)
                     firewall-cmd --permanent --add-port="$port/$p" >/dev/null && changed=1 ;;
                 iptables)
-                    ipt_port=${port/-/:}
                     for cmd in iptables ip6tables; do
-                        has $cmd || continue
-                        $cmd -C INPUT -p "$p" --dport "$ipt_port" -j ACCEPT 2>/dev/null ||
-                            $cmd -I INPUT -p "$p" --dport "$ipt_port" -j ACCEPT
+                        has $cmd && ipt_add "$cmd" -p "$p" --dport "${port/-/:}" -j ACCEPT
                     done
+                    state_add "$p" "$port"
                     changed=1 ;;
             esac
             printf '  %s✔%s %s/%s\n' "$GREEN" "$PLAIN" "$port" "$p"
@@ -410,7 +489,8 @@ close_port() {
                         while $cmd -C INPUT -p "$p" --dport "$ipt_port" -j ACCEPT 2>/dev/null; do
                             $cmd -D INPUT -p "$p" --dport "$ipt_port" -j ACCEPT
                         done
-                    done ;;
+                    done
+                    state_del "$p" "$port" ;;
             esac
             printf '  %s✘%s %s/%s\n' "$RED" "$PLAIN" "$port" "$p"
         done
@@ -525,32 +605,22 @@ lockdown() {
             firewall-cmd --reload >/dev/null
             ;;
         iptables)
+            state_ok=0
             for cmd in iptables ip6tables; do
                 has $cmd || continue
-                # -I 插入到最前面，所以先插端口规则，最后插回环和已建立连接
+                # -I 插入到最前面，所以先插端口规则，再插回环和已建立连接
                 while read -r p port _; do
-                    $cmd -C INPUT -p "$p" --dport "${port/-/:}" -j ACCEPT 2>/dev/null ||
-                        $cmd -I INPUT -p "$p" --dport "${port/-/:}" -j ACCEPT
+                    ipt_add "$cmd" -p "$p" --dport "${port/-/:}" -j ACCEPT
                 done <<<"$keep"
-                if [[ $cmd == iptables ]]; then
-                    $cmd -C INPUT -p icmp -j ACCEPT 2>/dev/null || $cmd -I INPUT -p icmp -j ACCEPT
-                else
-                    $cmd -C INPUT -p ipv6-icmp -j ACCEPT 2>/dev/null || $cmd -I INPUT -p ipv6-icmp -j ACCEPT
-                fi
-                state_ok=0
-                if $cmd -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
-                    $cmd -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
-                    $cmd -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
-                    $cmd -I INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
-                    state_ok=1
-                fi
-                $cmd -C INPUT -i lo -j ACCEPT 2>/dev/null || $cmd -I INPUT -i lo -j ACCEPT
-                if (( ! state_ok )); then
+                if ! ipt_base "$cmd"; then
                     error "$cmd 不支持连接状态匹配，为避免断网，未修改默认策略"
                     continue
                 fi
                 $cmd -P INPUT DROP
+                [[ $cmd == iptables ]] && state_ok=1
             done
+            while read -r p port _; do state_add "$p" "$port"; done <<<"$keep"
+            (( state_ok )) && state_policy DROP
             save_iptables
             ;;
     esac
@@ -579,6 +649,7 @@ unlock() {
             for cmd in iptables ip6tables; do
                 has $cmd && $cmd -P INPUT ACCEPT
             done
+            state_policy ACCEPT
             save_iptables ;;
     esac
     info "已恢复：所有入站端口均已放行"
@@ -674,8 +745,9 @@ update_self() {
 uninstall_self() {
     need_root || return 1
     remove_shortcuts
-    rm -f "$INSTALL_PATH"
-    info "portman 已卸载 (防火墙规则保持不变)"
+    remove_restore_service
+    rm -rf "$INSTALL_PATH" "${STATE_FILE%/*}"
+    info "portman 已卸载 (当前防火墙规则保持不变，但重启后不再自动恢复 iptables 规则)"
 }
 
 # ---------------------------------------------------------------------------
@@ -762,8 +834,9 @@ menu() {
 }
 
 main() {
-    [[ ${1:-} == uninstall ]] || ensure_shortcuts
+    [[ ${1:-} == uninstall || ${1:-} == restore ]] || ensure_shortcuts
     case ${1:-} in
+        restore)         restore_rules ;;
         "")              menu ;;
         list|ls|l)       show_ports all ;;
         public|pub)      show_ports public ;;

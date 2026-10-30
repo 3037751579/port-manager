@@ -70,7 +70,7 @@ udp   51820   公网   未放行   -               0.0.0.0                   -
 
 1. **UFW**（Ubuntu/Debian 常见）
 2. **firewalld**（CentOS/RHEL/Rocky/Alma 常见）
-3. **iptables**（规则会尝试持久化：`netfilter-persistent`、`/etc/sysconfig/iptables` 或 `/etc/iptables/`）
+3. **iptables**：portman 添加的规则记录在 `/etc/portman/iptables.conf`，并注册 systemd 服务 `portman-restore`，开机时自动恢复。只恢复 portman 自己的规则，不影响 docker、fail2ban 等程序的规则
 
 未检测到防火墙时，所有端口默认可访问，无需放行。
 
