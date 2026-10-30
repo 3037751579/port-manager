@@ -39,6 +39,8 @@ curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/instal
 | `portman open 80,443 both` | 同时放行 tcp 和 udp |
 | `portman open 10000-10100 udp` | 放行端口范围 |
 | `portman close 8080` | 关闭端口（删除放行规则） |
+| `portman lockdown` | 一键关闭其他端口，只保留正在使用的端口和 SSH |
+| `portman unlock` | 恢复放行全部端口（撤销 lockdown） |
 | `portman fw` | 查看防火墙状态和规则 |
 | `portman update` | 更新到最新版本 |
 | `portman uninstall` | 卸载 |
@@ -71,6 +73,16 @@ udp   51820   公网   未放行   -               0.0.0.0                   -
 3. **iptables**（规则会尝试持久化：`netfilter-persistent`、`/etc/sysconfig/iptables` 或 `/etc/iptables/`）
 
 未检测到防火墙时，所有端口默认可访问，无需放行。
+
+## 一键关闭其他端口
+
+`portman lockdown`（菜单第 6 项）会把防火墙设为「默认拒绝入站」，只放行：
+
+- 当前正在对公网监听的所有端口（例如 SSH、nginx、代理程序的端口）
+- 当前 SSH 端口（一定会保留，防止断连）
+- 执行时手动输入的额外端口
+
+执行前会列出要保留的端口，需要输入 `yes` 确认。已有的放行规则不会被删除。没有防火墙时，Debian/Ubuntu 上会询问是否安装 ufw。之后新装的程序需要用 `portman open` 放行端口；想撤销就运行 `portman unlock`。
 
 ## 注意
 

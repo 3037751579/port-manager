@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.0.2"
+VERSION="1.1.0"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -368,7 +368,7 @@ open_port() {
 # 待关闭的端口里是否包含当前 SSH 端口
 hits_ssh_port() {
     local ports=$1 sshp port lo hi
-    for sshp in $(collect_listen 2>/dev/null | awk -F'|' '$4 ~ /sshd/ { print $3 }' | sort -u); do
+    for sshp in $(ssh_ports); do
         for port in $ports; do
             lo=${port%-*}; hi=${port#*-}
             if (( sshp >= lo && sshp <= hi )); then echo "$sshp"; return 0; fi
@@ -424,6 +424,164 @@ close_port() {
         fi
     fi
     info "完成"
+}
+
+# ---------------------------------------------------------------------------
+# 一键关闭其他端口 / 恢复全部放行
+# ---------------------------------------------------------------------------
+# 当前 SSH 端口: 优先取本次连接的端口，其次是 sshd 正在监听的端口
+ssh_ports() {
+    {
+        [[ -n ${SSH_CONNECTION:-} ]] && awk '{ print $4 }' <<<"$SSH_CONNECTION"
+        collect_listen 2>/dev/null | awk -F'|' '$4 ~ /sshd/ { print $3 }'
+    } | sort -un
+}
+
+# 一键关闭时使用的防火墙: 已启用的 ufw/firewalld 优先，其次是已安装但未启用的 ufw，最后是 iptables
+lock_backend() {
+    local fw
+    fw=$(detect_firewall)
+    case $fw in
+        ufw|firewalld) echo "$fw" ;;
+        *) if has ufw; then echo ufw-off; else echo "$fw"; fi ;;
+    esac
+}
+
+# 输出要保留的端口，每行: 协议 端口 说明
+keep_list() {
+    local p
+    {
+        collect_listen | awk -F'|' '
+            !($2 ~ /^127\./ || $2 == "[::1]" || $2 == "::1" || $2 ~ /^\[::ffff:127\./ || $2 ~ /%lo$/) {
+                print $1, $3, $4
+            }'
+        p=$(ssh_ports)
+        for p in ${p:-22}; do echo "tcp $p SSH"; done
+    } | awk '!seen[$1 " " $2]++' | sort -k2,2n -k1,1
+}
+
+lockdown() {
+    need_root || return 1
+    local backend keep extra eprotos port p ans cmd state_ok
+
+    backend=$(lock_backend)
+    if [[ $backend == none ]]; then
+        warn "未检测到可用的防火墙"
+        if has apt-get; then
+            read -rp "是否安装 ufw 防火墙? [y/N]: " ans
+            [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+            apt-get update -qq && apt-get install -y -qq ufw || { error "ufw 安装失败"; return 1; }
+            backend=ufw-off
+        else
+            error "请先安装 firewalld 或 iptables"; return 1
+        fi
+    elif [[ $backend == nftables ]]; then
+        error "检测到原生 nftables 规则，暂不支持自动修改，请手动配置或改用 ufw/firewalld"
+        return 1
+    fi
+
+    keep=$(keep_list) || return 1
+    printf '%s以下正在使用的端口会被保留，其余所有入站端口将被关闭:%s\n\n' "$BOLD" "$PLAIN"
+    echo "  协议   端口        进程"
+    while read -r p port note; do
+        printf '  %s%-6s%s %-11s %s\n' "$CYAN" "$p" "$PLAIN" "$port" "$note"
+    done <<<"$keep"
+    echo
+
+    read -rp "如需额外保留端口请输入 (如 8080 / 80,443 / 8000-8100)，直接回车跳过: " extra
+    if [[ -n $extra ]]; then
+        extra=$(parse_ports "$extra") || return 1
+        read -rp "额外端口的协议 tcp/udp/both [默认 tcp]: " ans
+        eprotos=$(parse_proto "${ans:-tcp}") || return 1
+        for port in $extra; do
+            for p in $eprotos; do keep+=$'\n'"$p $port 手动添加"; done
+        done
+    fi
+
+    echo
+    warn "将使用 $(firewall_name "${backend%-off}") 设置为「默认拒绝入站」，只放行上面列出的端口"
+    warn "SSH 端口会自动保留；已有的放行规则不会被删除"
+    read -rp "确认执行请输入 yes: " ans
+    [[ $ans == yes ]] || { info "已取消"; return 0; }
+
+    case $backend in
+        ufw|ufw-off)
+            while read -r p port _; do
+                ufw allow "${port/-/:}/$p" >/dev/null
+            done <<<"$keep"
+            ufw default deny incoming >/dev/null
+            ufw default allow outgoing >/dev/null
+            [[ $backend == ufw-off ]] && ufw --force enable >/dev/null
+            ;;
+        firewalld)
+            local zone
+            zone=$(firewall-cmd --get-default-zone)
+            while read -r p port _; do
+                firewall-cmd --permanent --zone="$zone" --add-port="$port/$p" >/dev/null
+            done <<<"$keep"
+            if [[ $(firewall-cmd --permanent --zone="$zone" --get-target) == ACCEPT ]]; then
+                firewall-cmd --permanent --zone="$zone" --set-target=default >/dev/null
+            fi
+            firewall-cmd --reload >/dev/null
+            ;;
+        iptables)
+            for cmd in iptables ip6tables; do
+                has $cmd || continue
+                # -I 插入到最前面，所以先插端口规则，最后插回环和已建立连接
+                while read -r p port _; do
+                    $cmd -C INPUT -p "$p" --dport "${port/-/:}" -j ACCEPT 2>/dev/null ||
+                        $cmd -I INPUT -p "$p" --dport "${port/-/:}" -j ACCEPT
+                done <<<"$keep"
+                if [[ $cmd == iptables ]]; then
+                    $cmd -C INPUT -p icmp -j ACCEPT 2>/dev/null || $cmd -I INPUT -p icmp -j ACCEPT
+                else
+                    $cmd -C INPUT -p ipv6-icmp -j ACCEPT 2>/dev/null || $cmd -I INPUT -p ipv6-icmp -j ACCEPT
+                fi
+                state_ok=0
+                if $cmd -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+                    $cmd -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+                    $cmd -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+                    $cmd -I INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
+                    state_ok=1
+                fi
+                $cmd -C INPUT -i lo -j ACCEPT 2>/dev/null || $cmd -I INPUT -i lo -j ACCEPT
+                if (( ! state_ok )); then
+                    error "$cmd 不支持连接状态匹配，为避免断网，未修改默认策略"
+                    continue
+                fi
+                $cmd -P INPUT DROP
+            done
+            save_iptables
+            ;;
+    esac
+
+    info "完成！除上面列出的端口外，其余入站端口已全部关闭"
+    info "如需恢复，运行: portman unlock"
+    warn "建议先新开一个 SSH 窗口测试能否正常登录，确认后再关闭当前窗口"
+}
+
+unlock() {
+    need_root || return 1
+    local fw ans cmd
+    fw=$(detect_firewall)
+    if [[ $fw == none ]]; then info "未检测到防火墙，所有端口本来就是放行的"; return 0; fi
+    if [[ $fw == nftables ]]; then error "检测到原生 nftables 规则，暂不支持自动修改"; return 1; fi
+
+    read -rp "将把 $(firewall_name "$fw") 改为「默认放行所有入站端口」，确认? [y/N]: " ans
+    [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+
+    case $fw in
+        ufw) ufw default allow incoming >/dev/null ;;
+        firewalld)
+            firewall-cmd --permanent --zone="$(firewall-cmd --get-default-zone)" --set-target=ACCEPT >/dev/null
+            firewall-cmd --reload >/dev/null ;;
+        iptables)
+            for cmd in iptables ip6tables; do
+                has $cmd && $cmd -P INPUT ACCEPT
+            done
+            save_iptables ;;
+    esac
+    info "已恢复：所有入站端口均已放行"
 }
 
 show_firewall() {
@@ -536,10 +694,12 @@ portman v${VERSION} - VPS 端口查看与管理工具
    4. portman check <端口>           查询某个端口被哪个程序占用
    5. portman open  <端口> [协议]    放行(开启)端口，协议: tcp(默认) / udp / both
    6. portman close <端口> [协议]    关闭端口（删除防火墙放行规则）
-   7. portman fw                     查看防火墙状态和规则
-   8. portman update                 更新到最新版本
-   9. portman uninstall              卸载 portman（不影响已有防火墙规则）
-  10. portman version                查看当前版本
+   7. portman lockdown               一键关闭其他端口，只保留正在使用的端口和 SSH
+   8. portman unlock                 恢复放行全部端口（撤销第 7 项）
+   9. portman fw                     查看防火墙状态和规则
+  10. portman update                 更新到最新版本
+  11. portman uninstall              卸载 portman（不影响已有防火墙规则）
+  12. portman version                查看当前版本
 
 端口写法:
   8080          单个端口
@@ -570,12 +730,14 @@ menu() {
         echo "  3. 查询指定端口"
         echo "  4. 放行(开启)端口"
         echo "  5. 关闭端口"
-        echo "  6. 查看防火墙状态"
-        echo "  7. 更新 portman"
-        echo "  8. 卸载 portman"
+        echo "  6. 一键关闭其他端口 (只保留正在使用的端口)"
+        echo "  7. 恢复放行全部端口"
+        echo "  8. 查看防火墙状态"
+        echo "  9. 更新 portman"
+        echo " 10. 卸载 portman"
         echo "  0. 退出"
         echo
-        read -rp "请选择 [0-8]: " c
+        read -rp "请选择 [0-10]: " c
         echo
         case $c in
             1) show_ports all ;;
@@ -586,9 +748,11 @@ menu() {
                read -rp "端口 (如 8080 / 80,443 / 8000-8100): " port
                read -rp "协议 tcp/udp/both [默认 tcp]: " proto
                if [[ $c == 4 ]]; then open_port "$port" "${proto:-tcp}"; else close_port "$port" "${proto:-tcp}"; fi ;;
-            6) show_firewall ;;
-            7) update_self ;;
-            8) uninstall_self && exit 0 ;;
+            6) lockdown ;;
+            7) unlock ;;
+            8) show_firewall ;;
+            9) update_self ;;
+            10) uninstall_self && exit 0 ;;
             0|q) exit 0 ;;
             *) error "无效选择" ;;
         esac
@@ -608,6 +772,8 @@ main() {
             show_ports "$2" ;;
         open|allow)      [[ -n ${2:-} ]] || { usage; exit 1; }; open_port "$2" "${3:-tcp}" ;;
         close|deny)      [[ -n ${2:-} ]] || { usage; exit 1; }; close_port "$2" "${3:-tcp}" ;;
+        lockdown|lock)   lockdown ;;
+        unlock)          unlock ;;
         fw|firewall)     show_firewall ;;
         update)          update_self ;;
         uninstall)       uninstall_self ;;

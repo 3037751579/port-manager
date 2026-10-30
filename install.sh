@@ -58,6 +58,8 @@ cat <<'EOF'
   4. portman check 80      查询某个端口被谁占用
   5. portman open 8080     放行(开启) 8080 端口，默认 tcp
   6. portman close 8080    关闭 8080 端口（删除放行规则）
-  7. portman fw            查看防火墙状态和规则
-  8. portman help          查看全部命令和用法示例
+  7. portman lockdown      一键关闭其他端口，只保留正在使用的端口
+  8. portman unlock        恢复放行全部端口
+  9. portman fw            查看防火墙状态和规则
+ 10. portman help          查看全部命令和用法示例
 EOF
