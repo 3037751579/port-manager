@@ -5,10 +5,12 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
+BIN_DIR="/usr/local/bin"
+SHORTCUTS="s S"
 
 if [[ -t 1 ]]; then
     RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
@@ -451,6 +453,49 @@ download() {
     fi
 }
 
+# 快捷命令 s / S 是指向 portman 的软链接
+is_our_shortcut() {
+    [[ -L $1 && $(readlink -f "$1") == "$(readlink -f "$INSTALL_PATH")" ]]
+}
+
+setup_shortcuts() {
+    need_root || return 1
+    local k path existing
+    for k in $SHORTCUTS; do
+        path="$BIN_DIR/$k"
+        existing=$(command -v "$k" 2>/dev/null)
+        if is_our_shortcut "$path"; then
+            continue
+        elif [[ -n $existing && $existing != "$path" ]] || [[ -e $path ]]; then
+            warn "系统中已存在命令 $k ($existing)，跳过绑定"
+            continue
+        fi
+        ln -s "$INSTALL_PATH" "$path"
+    done
+    for k in $SHORTCUTS; do
+        if is_our_shortcut "$BIN_DIR/$k"; then
+            info "快捷键已绑定: 输入 ${BOLD}$k${PLAIN} 回车即可打开菜单"
+            return 0
+        fi
+    done
+}
+
+# 从旧版本更新上来时自动补上快捷命令，不输出任何提示
+ensure_shortcuts() {
+    is_root && [[ -x $INSTALL_PATH ]] || return 0
+    local k
+    for k in $SHORTCUTS; do
+        [[ -e $BIN_DIR/$k ]] || command -v "$k" >/dev/null 2>&1 || ln -s "$INSTALL_PATH" "$BIN_DIR/$k" 2>/dev/null
+    done
+}
+
+remove_shortcuts() {
+    local k
+    for k in $SHORTCUTS; do
+        is_our_shortcut "$BIN_DIR/$k" && rm -f "$BIN_DIR/$k"
+    done
+}
+
 update_self() {
     need_root || return 1
     local tmp
@@ -459,6 +504,7 @@ update_self() {
     if download "$RAW_URL/portman.sh" "$tmp" && bash -n "$tmp"; then
         install -m 755 "$tmp" "$INSTALL_PATH"
         rm -f "$tmp"
+        "$INSTALL_PATH" shortcut >/dev/null
         info "已更新到 $("$INSTALL_PATH" version)"
     else
         rm -f "$tmp"
@@ -469,6 +515,7 @@ update_self() {
 
 uninstall_self() {
     need_root || return 1
+    remove_shortcuts
     rm -f "$INSTALL_PATH"
     info "portman 已卸载 (防火墙规则保持不变)"
 }
@@ -479,6 +526,8 @@ uninstall_self() {
 usage() {
     cat <<EOF
 portman v${VERSION} - VPS 端口查看与管理工具
+
+快捷键: 输入 s (或 S) 回车，等同于 portman，直接打开菜单
 
 命令列表:
    1. portman                        打开交互菜单，输入数字选择功能
@@ -511,7 +560,11 @@ menu() {
     local c port proto
     while true; do
         clear 2>/dev/null
-        printf '%s===== portman v%s · 端口查看与管理 =====%s\n\n' "$BOLD" "$VERSION" "$PLAIN"
+        printf '%s===== portman v%s · 端口查看与管理 =====%s\n' "$BOLD" "$VERSION" "$PLAIN"
+        if is_our_shortcut "$BIN_DIR/s"; then
+            printf '      快捷键: 任意位置输入 %ss%s 回车即可打开本菜单\n' "$CYAN" "$PLAIN"
+        fi
+        echo
         echo "  1. 查看所有监听端口"
         echo "  2. 只看对公网开放的端口"
         echo "  3. 查询指定端口"
@@ -545,6 +598,7 @@ menu() {
 }
 
 main() {
+    [[ ${1:-} == uninstall ]] || ensure_shortcuts
     case ${1:-} in
         "")              menu ;;
         list|ls|l)       show_ports all ;;
@@ -557,6 +611,7 @@ main() {
         fw|firewall)     show_firewall ;;
         update)          update_self ;;
         uninstall)       uninstall_self ;;
+        shortcut)        setup_shortcuts ;;
         version|-v|--version) echo "portman v${VERSION}" ;;
         help|-h|--help)  usage ;;
         *)               error "未知命令: $1"; echo; usage; exit 1 ;;

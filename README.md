@@ -24,6 +24,8 @@ curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/instal
 
 安装后命令为 `portman`，位于 `/usr/local/bin/portman`。
 
+**快捷键**：安装时会同时绑定 `s` 和 `S`，在 SSH 里输入 `s` 回车即可直接打开菜单。如果系统里已有同名命令，会跳过绑定、不覆盖。
+
 ## 使用
 
 直接运行 `portman` 进入交互菜单，或使用子命令：

@@ -47,9 +47,11 @@ bash -n "$tmp"
 install -m 755 "$tmp" "$INSTALL_PATH"
 
 echo "${GREEN}[信息]${PLAIN} 安装完成: $("$INSTALL_PATH" version)"
+"$INSTALL_PATH" shortcut
 echo
 cat <<'EOF'
 常用命令:
+  0. s                     快捷键：输入 s 回车，直接打开菜单
   1. portman               打开交互菜单，输入数字选择功能
   2. portman list          查看所有监听端口（协议、进程、防火墙是否放行）
   3. portman public        只看对公网开放的端口
