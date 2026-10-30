@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -480,22 +480,28 @@ usage() {
     cat <<EOF
 portman v${VERSION} - VPS 端口查看与管理工具
 
-用法:
-  portman                       打开交互菜单
-  portman list                  查看所有监听端口
-  portman public                只看对公网监听的端口
-  portman check <端口>          查询指定端口
-  portman open  <端口> [协议]   放行端口，协议: tcp(默认) / udp / both
-  portman close <端口> [协议]   关闭(删除放行规则)
-  portman fw                    查看防火墙状态和规则
-  portman update                更新到最新版本
-  portman uninstall             卸载
+命令列表:
+   1. portman                        打开交互菜单，输入数字选择功能
+   2. portman list                   查看所有监听端口（协议、进程、防火墙是否放行）
+   3. portman public                 只看对公网开放的端口
+   4. portman check <端口>           查询某个端口被哪个程序占用
+   5. portman open  <端口> [协议]    放行(开启)端口，协议: tcp(默认) / udp / both
+   6. portman close <端口> [协议]    关闭端口（删除防火墙放行规则）
+   7. portman fw                     查看防火墙状态和规则
+   8. portman update                 更新到最新版本
+   9. portman uninstall              卸载 portman（不影响已有防火墙规则）
+  10. portman version                查看当前版本
 
-端口写法: 8080  |  80,443  |  8000-8100
+端口写法:
+  8080          单个端口
+  80,443        多个端口，用英文逗号分隔
+  8000-8100     端口范围
+
 示例:
-  portman open 8080
-  portman open 80,443 tcp
-  portman open 10000-10100 both
+  portman open 8080                 放行 8080/tcp
+  portman open 80,443 tcp           放行 80 和 443 的 tcp
+  portman open 10000-10100 both     放行 10000~10100 的 tcp 和 udp
+  portman close 8080                关闭 8080/tcp
 EOF
 }
 

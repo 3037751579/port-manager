@@ -48,7 +48,14 @@ install -m 755 "$tmp" "$INSTALL_PATH"
 
 echo "${GREEN}[信息]${PLAIN} 安装完成: $("$INSTALL_PATH" version)"
 echo
-echo "  portman              打开交互菜单"
-echo "  portman list         查看所有监听端口"
-echo "  portman open 8080    放行 8080/tcp"
-echo "  portman help         查看全部命令"
+cat <<'EOF'
+常用命令:
+  1. portman               打开交互菜单，输入数字选择功能
+  2. portman list          查看所有监听端口（协议、进程、防火墙是否放行）
+  3. portman public        只看对公网开放的端口
+  4. portman check 80      查询某个端口被谁占用
+  5. portman open 8080     放行(开启) 8080 端口，默认 tcp
+  6. portman close 8080    关闭 8080 端口（删除放行规则）
+  7. portman fw            查看防火墙状态和规则
+  8. portman help          查看全部命令和用法示例
+EOF
