@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -101,13 +101,34 @@ firewall_name() {
     esac
 }
 
-# 输出防火墙已放行的端口，每行一个: 协议:起始-结束 (协议可为 any)；全部放行时输出 ALL
-fw_allowed_list() {
+# 入站是否默认放行所有端口
+fw_default_open() {
     case $1 in
         ufw)
-            if LC_ALL=C ufw status verbose 2>/dev/null | grep -q "allow (incoming)"; then
-                echo ALL; return
-            fi
+            LC_ALL=C ufw status verbose 2>/dev/null | grep -q "allow (incoming)" ;;
+        firewalld)
+            [[ $(firewall-cmd --permanent --zone="$(firewall-cmd --get-default-zone 2>/dev/null)" --get-target 2>/dev/null) == ACCEPT ]] ;;
+        iptables)
+            local rules
+            rules=$(iptables -S INPUT 2>/dev/null)
+            # 默认策略为 ACCEPT 且没有"全部拒绝"类规则
+            grep -q -- "-P INPUT ACCEPT" <<<"$rules" &&
+                ! grep -E -- "-j (DROP|REJECT)" <<<"$rules" |
+                  grep -vqE -- "--dports? |-s |-i |state|-p icmp" ;;
+        none) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 输出防火墙已放行的端口，每行一个: 协议:起始-结束 (协议可为 any)；默认全部放行时输出 ALL
+fw_allowed_list() {
+    if fw_default_open "$1"; then echo ALL; else fw_rule_list "$1"; fi
+}
+
+# 输出防火墙里明确放行端口的规则，格式同上
+fw_rule_list() {
+    case $1 in
+        ufw)
             # user.rules 里的 tuple 行已把应用配置(如 OpenSSH)解析成了端口号
             cat /etc/ufw/user.rules /etc/ufw/user6.rules 2>/dev/null | awk '
                 /^### tuple ###/ && $4 ~ /^(allow|limit)/ && $NF == "in" {
@@ -120,9 +141,6 @@ fw_allowed_list() {
         firewalld)
             local zone p s
             zone=$(firewall-cmd --get-default-zone 2>/dev/null)
-            if [[ $(firewall-cmd --permanent --zone="$zone" --get-target 2>/dev/null) == ACCEPT ]]; then
-                echo ALL; return
-            fi
             for p in $(firewall-cmd --zone="$zone" --list-ports 2>/dev/null); do
                 echo "${p#*/}:${p%/*}"
             done
@@ -133,15 +151,7 @@ fw_allowed_list() {
             done
             ;;
         iptables)
-            local rules
-            rules=$(iptables -S INPUT 2>/dev/null)
-            # 默认策略为 ACCEPT 且没有"全部拒绝"类规则，视为全部放行
-            if grep -q -- "-P INPUT ACCEPT" <<<"$rules" &&
-                ! grep -E -- "-j (DROP|REJECT)" <<<"$rules" |
-                  grep -vqE -- "--dports? |-s |-i |state|-p icmp"; then
-                echo ALL; return
-            fi
-            awk '/-j ACCEPT/ && /--dports? / {
+            iptables -S INPUT 2>/dev/null | awk '/-j ACCEPT/ && /--dports? / {
                 proto = "any"; d = ""
                 for (i = 1; i <= NF; i++) {
                     if ($i == "-p") proto = $(i + 1)
@@ -149,9 +159,8 @@ fw_allowed_list() {
                 }
                 n = split(d, a, ",")
                 for (j = 1; j <= n; j++) { r = a[j]; sub(/:/, "-", r); print proto ":" r }
-            }' <<<"$rules"
+            }'
             ;;
-        none) echo ALL ;;
     esac
 }
 
@@ -160,19 +169,20 @@ fw_allowed_list() {
 #   $1: all | public | <端口号>
 # ---------------------------------------------------------------------------
 show_ports() {
-    local mode=${1:-all} data fw allowed=""
+    local mode=${1:-all} data fw allowed="" defopen=0
     data=$(collect_listen) || return 1
 
     if is_root; then
         fw=$(detect_firewall)
-        allowed=$(fw_allowed_list "$fw" | tr '\n' ' ')
+        allowed=$(fw_rule_list "$fw" | tr '\n' ' ')
+        fw_default_open "$fw" && defopen=1
     else
         fw=unknown
         warn "当前不是 root，进程信息和防火墙状态可能不完整"
     fi
 
     printf '%s\n' "$data" | LC_ALL=C awk -F'|' \
-        -v mode="$mode" -v fw="$fw" -v allowed="$allowed" \
+        -v mode="$mode" -v fw="$fw" -v allowed="$allowed" -v defopen="$defopen" \
         -v G="$GREEN" -v R="$RED" -v Y="$YELLOW" -v C="$CYAN" -v B="$BOLD" -v P="$PLAIN" '
     # 显示宽度: 3 字节的中文按 2 列算，2 字节字符按 1 列算
     function dw(s,   t, n3, n2) {
@@ -243,7 +253,9 @@ show_ports() {
             if (PUB[k]) {
                 npub++; scope = cell("公网", 7, Y)
                 if (fw == "unknown" || fw == "nftables") st = cell("未知", 9, "")
+                else if (fw == "none") st = cell("无防火墙", 9, Y)
                 else if (fw_allows(proto, port)) st = cell("已放行", 9, G)
+                else if (defopen) st = cell("默认放行", 9, Y)
                 else { st = cell("未放行", 9, R); nblock++ }
             } else {
                 scope = cell("本机", 7, ""); st = cell("-", 9, "")
@@ -261,7 +273,14 @@ show_ports() {
         print ""
     }'
 
-    printf '防火墙: %s\n' "$(firewall_name "$fw")"
+    printf '防火墙: %s' "$(firewall_name "$fw")"
+    if (( defopen )) && [[ $fw != none ]]; then
+        printf '  %s(入站默认放行：所有端口都能从外部访问)%s' "$YELLOW" "$PLAIN"
+    elif [[ $fw == ufw || $fw == firewalld || $fw == iptables ]]; then
+        printf '  %s(入站默认拒绝：只有已放行的端口能访问)%s' "$GREEN" "$PLAIN"
+    fi
+    echo
+    printf '说明: 已放行=有明确放行规则  默认放行=没有规则但防火墙未拦截  未放行=外部无法访问\n'
     printf '%s提示: 云服务器(阿里云/腾讯云/AWS 等)还需在控制台「安全组」中放行端口，本脚本无法修改安全组。%s\n' "$YELLOW" "$PLAIN"
 }
 
@@ -657,18 +676,79 @@ unlock() {
 
 show_firewall() {
     need_root || return 1
-    local fw
+    local fw rules icmp
     fw=$(detect_firewall)
-    printf '%s防火墙: %s%s\n\n' "$BOLD" "$(firewall_name "$fw")" "$PLAIN"
+
+    printf '%s防火墙类型:%s %s\n' "$BOLD" "$PLAIN" "$(firewall_name "$fw")"
+    if [[ $fw == nftables ]]; then
+        warn "原生 nftables 规则暂不支持解析，以下为原始规则"
+        echo; nft list ruleset; return
+    fi
+
+    printf '%s入站策略:%s   ' "$BOLD" "$PLAIN"
+    if [[ $fw == none ]]; then
+        printf '%s没有防火墙，所有端口都能从外部访问%s\n' "$YELLOW" "$PLAIN"
+    elif fw_default_open "$fw"; then
+        printf '%s默认放行 —— 所有端口都能从外部访问%s\n' "$YELLOW" "$PLAIN"
+    else
+        printf '%s默认拒绝 —— 只有下方已放行的端口能访问%s\n' "$GREEN" "$PLAIN"
+    fi
+
+    icmp="允许 (系统默认)"
+    if [[ $fw == iptables ]] && ! fw_default_open iptables; then
+        if iptables -S INPUT 2>/dev/null | grep -qE -- "-p icmp .*-j ACCEPT|-p icmp -j ACCEPT"; then icmp="允许"
+        else icmp="${RED}禁止${PLAIN}"; fi
+    elif [[ $fw == none ]] || fw_default_open "$fw"; then
+        icmp="允许"
+    fi
+    printf '%sICMP(ping):%s %s\n' "$BOLD" "$PLAIN" "$icmp"
+
+    if [[ $fw == iptables ]]; then
+        printf '%s重启后恢复:%s ' "$BOLD" "$PLAIN"
+        if systemctl is-enabled "$SERVICE_NAME" >/dev/null 2>&1; then
+            printf '%s已开启%s (规则记录在 %s)\n' "$GREEN" "$PLAIN" "$STATE_FILE"
+        else
+            printf '%s未开启%s (portman 添加规则后会自动开启)\n' "$YELLOW" "$PLAIN"
+        fi
+    fi
+
+    [[ $fw == none ]] && return 0
+
+    echo
+    printf '%s已放行的端口规则:%s\n' "$BOLD" "$PLAIN"
+    rules=$(fw_rule_list "$fw" | awk '!seen[$0]++')
+    if [[ -z $rules ]]; then
+        echo "  (没有单独的放行规则)"
+    else
+        echo "  协议     端口          当前使用情况"
+        { collect_listen 2>/dev/null; echo "--"; echo "$rules"; } | LC_ALL=C awk -F'|' \
+            -v G="$GREEN" -v C="$CYAN" -v P="$PLAIN" '
+            $0 == "--" { phase = 1; next }
+            phase == 0 { if (!(($1 "/" $3) in L)) L[$1 "/" $3] = $4; next }
+            {
+                split($0, a, ":"); proto = a[1]; r = a[2]
+                if (r ~ /-/) { split(r, b, "-"); if (b[1] == b[2]) r = b[1] }
+                if (r == "1-65535") use = "全部端口"
+                else if (r ~ /-/) use = "端口范围"
+                else {
+                    use = ""
+                    if (proto != "udp" && (("tcp/" r) in L)) use = "tcp: " L["tcp/" r]
+                    if (proto != "tcp" && (("udp/" r) in L)) use = use (use == "" ? "" : "  ") "udp: " L["udp/" r]
+                    use = (use == "") ? "无程序监听" : G use P
+                }
+                if (proto == "any") proto = "tcp/udp"
+                printf "  %s%-8s%s %-13s %s\n", C, proto, P, r, use
+            }'
+    fi
+
+    echo
+    printf '%s原始规则:%s\n' "$BOLD" "$PLAIN"
     case $fw in
-        ufw)       ufw status verbose ;;
+        ufw)       ufw status numbered ;;
         firewalld) firewall-cmd --list-all ;;
         iptables)
-            iptables -L INPUT -n -v --line-numbers
-            [[ $(fw_allowed_list iptables) == ALL ]] && echo && info "当前 INPUT 默认放行，所有端口都可以访问"
-            ;;
-        nftables)  nft list ruleset ;;
-        none)      info "所有端口都不受本机防火墙限制" ;;
+            echo "[IPv4]"; iptables -L INPUT -n --line-numbers
+            if has ip6tables; then echo; echo "[IPv6]"; ip6tables -L INPUT -n --line-numbers; fi ;;
     esac
 }
 
