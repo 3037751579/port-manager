@@ -61,5 +61,7 @@ cat <<'EOF'
   7. portman lockdown      一键关闭其他端口，只保留正在使用的端口
   8. portman unlock        恢复放行全部端口
   9. portman fw            查看防火墙状态和规则
- 10. portman help          查看全部命令和用法示例
+ 10. portman ip            查看 IPv4 / IPv6 状态
+ 11. portman ipv6 off/on   关闭 / 开启 IPv6，重启后保持
+ 12. portman help          查看全部命令和用法示例
 EOF

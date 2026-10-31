@@ -42,6 +42,9 @@ curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/instal
 | `portman lockdown` | 一键关闭其他端口，只保留正在使用的端口和 SSH |
 | `portman unlock` | 恢复放行全部端口（撤销 lockdown） |
 | `portman fw` | 查看防火墙状态和规则 |
+| `portman ip` | 查看 IPv4 / IPv6 状态：是否启用、地址、默认路由、能否访问外网 |
+| `portman ipv6 off` | 禁用 IPv6，重启后保持 |
+| `portman ipv6 on` | 启用 IPv6，重启后保持 |
 | `portman update` | 更新到最新版本 |
 | `portman uninstall` | 卸载 |
 
@@ -83,6 +86,14 @@ udp   51820   公网   未放行   -               0.0.0.0                   -
 - 执行时手动输入的额外端口
 
 执行前会列出要保留的端口，需要输入 `yes` 确认。已有的放行规则不会被删除。没有防火墙时，Debian/Ubuntu 上会询问是否安装 ufw。之后新装的程序需要用 `portman open` 放行端口；想撤销就运行 `portman unlock`。
+
+## 开关 IPv6
+
+`portman ipv6 off`（菜单第 10 项）把设置写入 `/etc/sysctl.d/99-zz-portman-ipv6.conf`，立即生效，开机时由系统自动加载。本机回环 `::1` 会保留，避免依赖它的程序出错。
+
+- 当前通过 IPv6 连接 SSH，或机器没有 IPv4 时，会拒绝禁用，防止断连
+- `portman ipv6 on` 会删除该文件并立即启用；如果其他配置文件也在禁用 IPv6，会列出来提示
+- 若 IPv6 是被内核启动参数 `ipv6.disable=1` 禁用的，需要修改 GRUB，脚本会给出步骤
 
 ## 注意
 

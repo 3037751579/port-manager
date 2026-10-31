@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -753,6 +753,174 @@ show_firewall() {
 }
 
 # ---------------------------------------------------------------------------
+# IPv4 / IPv6 状态与 IPv6 开关
+#   禁用写入 sysctl.d 配置文件，开机由 systemd-sysctl 自动加载。
+#   文件名以 99-zz 开头，排在 99-sysctl.conf 之后，不会被系统默认配置覆盖。
+# ---------------------------------------------------------------------------
+SYSCTL_FILE="/etc/sysctl.d/99-zz-portman-ipv6.conf"
+
+# 输出: kernel-off (内核参数禁用) | off (sysctl 禁用) | on
+ipv6_state() {
+    [[ -d /proc/sys/net/ipv6 ]] || { echo kernel-off; return; }
+    local dev
+    dev=$(ip -4 route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+    if [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) == 1 ]] ||
+        [[ -n $dev && $(cat "/proc/sys/net/ipv6/conf/$dev/disable_ipv6" 2>/dev/null) == 1 ]]; then
+        echo off
+    else
+        echo on
+    fi
+}
+
+# 系统里其他会在开机时禁用 IPv6 的 sysctl 配置
+ipv6_other_disablers() {
+    grep -lsE '^[[:space:]]*net\.ipv6\.conf\.(all|default)\.disable_ipv6[[:space:]]*=[[:space:]]*1' \
+        /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf 2>/dev/null |
+        grep -vxF "$SYSCTL_FILE"
+}
+
+# 用外部服务检测出口 IP，$1 为 4 或 6
+public_ip() {
+    local url ip
+    for url in https://api64.ipify.org https://icanhazip.com; do
+        if has curl; then ip=$(curl -"$1" -fsS -m 5 "$url" 2>/dev/null)
+        elif has wget; then ip=$(wget -"$1" -qO- -T 5 "$url" 2>/dev/null)
+        else return 1; fi
+        ip=$(tr -d '[:space:]' <<<"$ip")
+        [[ -n $ip ]] && { echo "$ip"; return 0; }
+    done
+    return 1
+}
+
+print_ip_family() {
+    local v=$1 addrs route pub label
+    addrs=$(ip -o -"$v" addr show scope global 2>/dev/null | awk '{ printf "%s%s %s", (n++ ? "\n          " : ""), $2, $4 }')
+    route=$(ip -"$v" route show default 2>/dev/null | head -1)
+    printf '本机地址: %s\n' "${addrs:-${YELLOW}无公网地址${PLAIN}}"
+    printf '默认路由: %s\n' "${route:-${YELLOW}无${PLAIN}}"
+    if [[ -z $route ]]; then
+        printf '外网连通: %s✘ 无法访问 (没有默认路由)%s\n' "$RED" "$PLAIN"
+    elif pub=$(public_ip "$v"); then
+        printf '外网连通: %s✔ 正常%s  出口 IP: %s\n' "$GREEN" "$PLAIN" "$pub"
+    else
+        printf '外网连通: %s✘ 无法访问外网%s\n' "$RED" "$PLAIN"
+    fi
+}
+
+show_ip_status() {
+    local state others
+    if ! has ip; then error "未找到 ip 命令，请先安装 iproute2"; return 1; fi
+    info "正在检测网络，最多需要十几秒..."
+    echo
+
+    printf '%s========== IPv4 ==========%s\n' "$BOLD" "$PLAIN"
+    if [[ -n $(ip -o -4 addr show scope global 2>/dev/null) ]]; then
+        printf '状态:     %s已启用%s\n' "$GREEN" "$PLAIN"
+    else
+        printf '状态:     %s没有 IPv4 地址%s (可能是纯 IPv6 机器)\n' "$YELLOW" "$PLAIN"
+    fi
+    print_ip_family 4
+    echo
+
+    printf '%s========== IPv6 ==========%s\n' "$BOLD" "$PLAIN"
+    state=$(ipv6_state)
+    case $state in
+        on)  printf '状态:     %s已启用%s\n' "$GREEN" "$PLAIN" ;;
+        off) printf '状态:     %s已禁用%s\n' "$RED" "$PLAIN" ;;
+        kernel-off) printf '状态:     %s已禁用 (内核启动参数 ipv6.disable=1)%s\n' "$RED" "$PLAIN" ;;
+    esac
+    others=$(ipv6_other_disablers | tr '\n' ' ')
+    if [[ -f $SYSCTL_FILE ]]; then
+        printf '开机设置: 由 portman 禁用，重启后保持 (%s)\n' "$SYSCTL_FILE"
+    elif [[ -n $others ]]; then
+        printf '开机设置: 被 %s禁用\n' "$others"
+    elif [[ $state != kernel-off ]]; then
+        printf '开机设置: 系统默认 (启用)\n'
+    fi
+    [[ $state == on ]] && print_ip_family 6
+}
+
+ipv6_disable() {
+    need_root || return 1
+    local state server_ip ans
+    state=$(ipv6_state)
+    if [[ $state == kernel-off ]]; then info "IPv6 已被内核参数禁用，无需操作"; return 0; fi
+
+    server_ip=$(awk '{ print $3 }' <<<"${SSH_CONNECTION:-}")
+    if [[ $server_ip == *:* && $server_ip != ::ffff:* ]]; then
+        error "你当前是通过 IPv6 连接的 SSH，禁用后会立即断开。请改用 IPv4 地址连接后再操作"
+        return 1
+    fi
+    if [[ -z $(ip -4 route show default 2>/dev/null) ]]; then
+        error "没有检测到 IPv4 默认路由，这台机器可能只有 IPv6，禁用后将无法联网"
+        return 1
+    fi
+
+    warn "禁用后，服务器的 IPv6 地址会失效，IPv6 入站和出站都将不可用 (本机回环 ::1 保留)"
+    read -rp "确认禁用 IPv6? [y/N]: " ans
+    [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+
+    cat >"$SYSCTL_FILE" <<'EOF'
+# 由 portman 生成: 禁用 IPv6，保留本机回环 ::1
+# 删除本文件并重启即可恢复 IPv6，或运行: portman ipv6 on
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 0
+EOF
+    sysctl -p "$SYSCTL_FILE" >/dev/null
+    info "IPv6 已禁用，重启后保持"
+}
+
+ipv6_enable() {
+    need_root || return 1
+    local state others
+    state=$(ipv6_state)
+    if [[ $state == kernel-off ]]; then
+        error "IPv6 被内核启动参数 ipv6.disable=1 禁用，无法在线开启"
+        echo "  请编辑 /etc/default/grub，删除 GRUB_CMDLINE_LINUX 里的 ipv6.disable=1，"
+        echo "  然后执行 update-grub (CentOS: grub2-mkconfig -o /boot/grub2/grub.cfg) 并重启"
+        return 1
+    fi
+
+    rm -f "$SYSCTL_FILE"
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 \
+        net.ipv6.conf.lo.disable_ipv6=0 >/dev/null
+    info "IPv6 已启用"
+
+    others=$(ipv6_other_disablers)
+    if [[ -n $others ]]; then
+        warn "以下配置文件会在开机时再次禁用 IPv6，请手动删除其中的 disable_ipv6 = 1:"
+        printf '  %s\n' $others
+    else
+        info "重启后保持启用"
+    fi
+
+    sleep 3
+    if [[ -z $(ip -o -6 addr show scope global 2>/dev/null) ]]; then
+        warn "网卡暂时还没有拿到 IPv6 地址。如果服务商分配了 IPv6，重启服务器后即可恢复"
+    fi
+}
+
+ipv6_menu() {
+    local c state
+    state=$(ipv6_state)
+    case $state in
+        on)  printf 'IPv6 当前状态: %s已启用%s\n\n' "$GREEN" "$PLAIN" ;;
+        *)   printf 'IPv6 当前状态: %s已禁用%s\n\n' "$RED" "$PLAIN" ;;
+    esac
+    echo "  1. 禁用 IPv6 (重启后保持)"
+    echo "  2. 启用 IPv6 (重启后保持)"
+    echo "  0. 返回"
+    echo
+    read -rp "请选择 [0-2]: " c
+    case $c in
+        1) ipv6_disable ;;
+        2) ipv6_enable ;;
+        *) return 0 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # 更新 / 卸载
 # ---------------------------------------------------------------------------
 download() {
@@ -828,6 +996,9 @@ uninstall_self() {
     remove_restore_service
     rm -rf "$INSTALL_PATH" "${STATE_FILE%/*}"
     info "portman 已卸载 (当前防火墙规则保持不变，但重启后不再自动恢复 iptables 规则)"
+    if [[ -f $SYSCTL_FILE ]]; then
+        warn "IPv6 仍保持禁用。如需恢复，删除 $SYSCTL_FILE 后重启"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -849,9 +1020,12 @@ portman v${VERSION} - VPS 端口查看与管理工具
    7. portman lockdown               一键关闭其他端口，只保留正在使用的端口和 SSH
    8. portman unlock                 恢复放行全部端口（撤销第 7 项）
    9. portman fw                     查看防火墙状态和规则
-  10. portman update                 更新到最新版本
-  11. portman uninstall              卸载 portman（不影响已有防火墙规则）
-  12. portman version                查看当前版本
+  10. portman ip                     查看 IPv4 / IPv6 状态（地址、路由、能否上网）
+  11. portman ipv6 off               禁用 IPv6，重启后保持
+  12. portman ipv6 on                启用 IPv6，重启后保持
+  13. portman update                 更新到最新版本
+  14. portman uninstall              卸载 portman（不影响已有防火墙规则）
+  15. portman version                查看当前版本
 
 端口写法:
   8080          单个端口
@@ -885,11 +1059,13 @@ menu() {
         echo "  6. 一键关闭其他端口 (只保留正在使用的端口)"
         echo "  7. 恢复放行全部端口"
         echo "  8. 查看防火墙状态"
-        echo "  9. 更新 portman"
-        echo " 10. 卸载 portman"
+        echo "  9. 查看 IPv4 / IPv6 状态"
+        echo " 10. 开启 / 关闭 IPv6"
+        echo " 11. 更新 portman"
+        echo " 12. 卸载 portman"
         echo "  0. 退出"
         echo
-        read -rp "请选择 [0-10]: " c
+        read -rp "请选择 [0-12]: " c
         echo
         case $c in
             1) show_ports all ;;
@@ -903,8 +1079,10 @@ menu() {
             6) lockdown ;;
             7) unlock ;;
             8) show_firewall ;;
-            9) update_self ;;
-            10) uninstall_self && exit 0 ;;
+            9) show_ip_status ;;
+            10) ipv6_menu ;;
+            11) update_self ;;
+            12) uninstall_self && exit 0 ;;
             0|q) exit 0 ;;
             *) error "无效选择" ;;
         esac
@@ -928,6 +1106,13 @@ main() {
         lockdown|lock)   lockdown ;;
         unlock)          unlock ;;
         fw|firewall)     show_firewall ;;
+        ip)              show_ip_status ;;
+        ipv6)
+            case ${2:-} in
+                on)  ipv6_enable ;;
+                off) ipv6_disable ;;
+                *)   ipv6_menu ;;
+            esac ;;
         update)          update_self ;;
         uninstall)       uninstall_self ;;
         shortcut)        setup_shortcuts ;;
