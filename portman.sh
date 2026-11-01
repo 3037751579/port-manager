@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -921,6 +921,431 @@ ipv6_menu() {
 }
 
 # ---------------------------------------------------------------------------
+# SSH 密钥登录
+#   有 sshd_config.d 时写入 00-key-only.conf (与常见代码片段同名，可互相识别)；
+#   否则在 sshd_config 顶部插入带标记的配置块。sshd 取第一次出现的值，所以都排在最前。
+# ---------------------------------------------------------------------------
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_DIR="/etc/ssh/sshd_config.d"
+KEY_ONLY_FILE="$SSHD_DIR/00-key-only.conf"
+PASSWORD_FILE="$SSHD_DIR/00-password-login.conf"
+SSHD_MARK_BEGIN="# >>> portman ssh >>>"
+SSHD_MARK_END="# <<< portman ssh <<<"
+SSH_CONF="/etc/portman/ssh.conf"
+KEY_RE='^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+=*( |$)'
+
+auth_keys_file() { echo "${HOME:-/root}/.ssh/authorized_keys"; }
+
+file_mode() { stat -c %a "$1" 2>/dev/null; }
+
+sshd_bin() {
+    local p
+    for p in "$(command -v sshd 2>/dev/null)" /usr/sbin/sshd /sbin/sshd; do
+        [[ -n $p && -x $p ]] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+# sshd 实际生效的配置，每行: 小写键名 值
+sshd_effective() {
+    local b
+    b=$(sshd_bin) || return 1
+    "$b" -T 2>/dev/null
+}
+
+eff_get() { awk -v k="$2" '$1 == k { print $2; exit }' <<<"$1"; }
+
+# 列出 authorized_keys 里的公钥，每行: 类型|指纹|备注
+list_keys() {
+    local f
+    f=$(auth_keys_file)
+    [[ -s $f ]] || return 0
+    if has ssh-keygen; then
+        ssh-keygen -lf "$f" 2>/dev/null | awk '{
+            type = $NF; gsub(/[()]/, "", type); c = ""
+            for (i = 3; i < NF; i++) c = c (c == "" ? "" : " ") $i
+            print type "|" $2 "|" (c == "" ? "-" : c)
+        }'
+    else
+        grep -oE '(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/]+=*( [^ ].*)?$' "$f" |
+            awk '{ c = ""; for (i = 3; i <= NF; i++) c = c (c == "" ? "" : " ") $i; print $1 "|-|" (c == "" ? "-" : c) }'
+    fi
+}
+
+key_count() { list_keys | grep -c . ; }
+
+print_keys() {
+    list_keys | awk -F'|' -v C="$CYAN" -v P="$PLAIN" '{ printf "  %d. %s%-8s%s %s  %s\n", NR, C, $1, P, $2, $3 }'
+}
+
+sshd_has_include() {
+    grep -Eiq '^[[:space:]]*Include[[:space:]].*sshd_config\.d/' "$SSHD_CONFIG" 2>/dev/null
+}
+
+ssh_service_state() {
+    local svc
+    if has systemctl; then
+        for svc in ssh sshd; do
+            systemctl is-active --quiet "$svc.service" 2>/dev/null && { echo "运行中 ($svc.service)"; return 0; }
+        done
+        systemctl is-active --quiet ssh.socket 2>/dev/null && { echo "运行中 (ssh.socket 按需启动)"; return 0; }
+    fi
+    pgrep -x sshd >/dev/null 2>&1 && { echo "运行中"; return 0; }
+    echo "未运行"; return 1
+}
+
+reload_sshd() {
+    local svc
+    if has systemctl; then
+        for svc in ssh sshd; do
+            if systemctl is-active --quiet "$svc.service" 2>/dev/null; then
+                systemctl reload "$svc.service" 2>/dev/null && return 0
+            fi
+        done
+        # socket 按需启动时，每个新连接都会读取最新配置
+        systemctl is-active --quiet ssh.socket 2>/dev/null && return 0
+    fi
+    if has service; then
+        service ssh reload >/dev/null 2>&1 || service sshd reload >/dev/null 2>&1
+        return
+    fi
+    return 1
+}
+
+# 移除 portman 写入的所有 sshd 配置
+clear_sshd_conf() {
+    rm -f "$KEY_ONLY_FILE" "$PASSWORD_FILE"
+    sed -i "/^$SSHD_MARK_BEGIN\$/,/^$SSHD_MARK_END\$/d" "$SSHD_CONFIG"
+}
+
+# 写入 sshd 配置并重载，配置检查失败时自动回滚
+#   $1: file | block   $2: 配置文件路径 (file 模式)   $3: 配置内容，为空表示只清除
+apply_sshd_conf() {
+    local mode=$1 file=$2 content=$3 b bak err main
+    b=$(sshd_bin) || { error "未找到 sshd"; return 1; }
+    bak=$(mktemp -d)
+    cp -p "$SSHD_CONFIG" "$bak/main"
+    [[ -f $KEY_ONLY_FILE ]] && cp -p "$KEY_ONLY_FILE" "$bak/keyonly"
+    [[ -f $PASSWORD_FILE ]] && cp -p "$PASSWORD_FILE" "$bak/password"
+
+    clear_sshd_conf
+    if [[ -n $content ]]; then
+        if [[ $mode == file ]]; then
+            mkdir -p "$SSHD_DIR"
+            printf '# 由 portman 生成\n%s\n' "$content" >"$file"
+            chmod 644 "$file"
+        else
+            main=$(cat "$SSHD_CONFIG")
+            printf '%s\n%s\n%s\n%s\n' "$SSHD_MARK_BEGIN" "$content" "$SSHD_MARK_END" "$main" >"$SSHD_CONFIG"
+        fi
+    fi
+
+    if ! err=$("$b" -t 2>&1); then
+        cat "$bak/main" >"$SSHD_CONFIG"
+        rm -f "$KEY_ONLY_FILE" "$PASSWORD_FILE"
+        [[ -f $bak/keyonly ]] && cp -p "$bak/keyonly" "$KEY_ONLY_FILE"
+        [[ -f $bak/password ]] && cp -p "$bak/password" "$PASSWORD_FILE"
+        rm -rf "$bak"
+        error "sshd 配置检查失败，已自动回滚，没有做任何改动:"
+        printf '  %s\n' "$err"
+        return 1
+    fi
+    rm -rf "$bak"
+    reload_sshd || warn "sshd 重新加载失败，请手动执行: systemctl restart ssh"
+    return 0
+}
+
+# 哪些配置文件设置了某个选项，例如 PasswordAuthentication
+show_setting_sources() {
+    local files=("$SSHD_CONFIG")
+    [[ -d $SSHD_DIR ]] && files+=("$SSHD_DIR"/*.conf)
+    grep -HnEi "^[[:space:]]*$1[[:space:]]" "${files[@]}" 2>/dev/null | sed 's/^/    /'
+}
+
+ssh_add_key() {
+    need_root || return 1
+    local src=${1:-} last="" url="" tmp keys f line body added=0 dup=0
+    [[ -f $SSH_CONF ]] && last=$(sed -n 's/^KEY_SOURCE=//p' "$SSH_CONF" | tail -1)
+
+    if [[ -z $src ]]; then
+        echo "公钥来源，支持以下几种:"
+        echo "  - Termius / sshid.io 用户名，例如: abc123  (等同于 https://sshid.io/abc123)"
+        echo "  - 公钥链接，例如: https://github.com/你的用户名.keys"
+        echo "  - 直接粘贴公钥，例如: ssh-ed25519 AAAA... 备注"
+        if [[ -n $last ]]; then
+            read -rp "请输入 [回车使用上次的 ${last:0:40}]: " src
+            src=${src:-$last}
+        else
+            read -rp "请输入: " src
+        fi
+    fi
+    src=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$src")
+    [[ -n $src ]] || { error "没有输入公钥来源"; return 1; }
+
+    tmp=$(mktemp)
+    case $src in
+        http://*|https://*) url=$src ;;
+        ssh-*|ecdsa-*|sk-*) printf '%s\n' "$src" >"$tmp" ;;
+        *)
+            if [[ $src =~ ^[A-Za-z0-9._-]+$ ]]; then
+                url="https://sshid.io/$src"
+            else
+                rm -f "$tmp"; error "无法识别的公钥来源: $src"; return 1
+            fi ;;
+    esac
+    if [[ -n $url ]]; then
+        info "正在获取公钥: $url"
+        download "$url" "$tmp" || { rm -f "$tmp"; error "下载失败，请检查链接或用户名"; return 1; }
+    fi
+
+    keys=$(tr -d '\r' <"$tmp" | grep -E "$KEY_RE")
+    if [[ -z $keys ]]; then
+        error "没有获取到有效的公钥，内容开头为: $(head -c 80 "$tmp" | tr '\n' ' ')"
+        rm -f "$tmp"; return 1
+    fi
+    rm -f "$tmp"
+
+    f=$(auth_keys_file)
+    mkdir -p "${f%/*}" && chmod 700 "${f%/*}"
+    touch "$f" && chmod 600 "$f"
+    # 文件末尾没有换行时先补上，避免和新公钥连成一行
+    [[ -s $f && -n $(tail -c1 "$f") ]] && echo >>"$f"
+    while read -r line; do
+        body=$(awk '{ print $2 }' <<<"$line")
+        if grep -qF "$body" "$f"; then
+            dup=$((dup + 1))
+        else
+            echo "$line" >>"$f"; added=$((added + 1))
+        fi
+    done <<<"$keys"
+    has restorecon && restorecon -R "${f%/*}" 2>/dev/null
+
+    mkdir -p "${SSH_CONF%/*}"
+    printf 'KEY_SOURCE=%s\n' "$src" >"$SSH_CONF"
+
+    info "新写入 $added 个公钥，$dup 个之前已存在"
+    echo "当前 $f 中的公钥:"
+    print_keys
+}
+
+ssh_key_only() {
+    need_root || return 1
+    local auto=${1:-} n eff kbdkey content pw ans mode
+    n=$(key_count)
+    if (( n == 0 )); then
+        warn "还没有写入任何公钥，直接关闭密码登录会导致无法登录"
+        [[ $auto == -y ]] && { error "请先运行: portman ssh addkey <用户名或链接>"; return 1; }
+        read -rp "现在写入公钥吗? [Y/n]: " ans
+        [[ $ans == [nN] ]] && { info "已取消"; return 0; }
+        ssh_add_key || return 1
+        n=$(key_count)
+        (( n > 0 )) || return 1
+    fi
+
+    eff=$(sshd_effective)
+    if [[ -z $eff ]]; then
+        error "无法读取 sshd 配置，请先检查: $(sshd_bin) -t"; return 1
+    fi
+    kbdkey=KbdInteractiveAuthentication
+    grep -q '^kbdinteractiveauthentication ' <<<"$eff" || kbdkey=ChallengeResponseAuthentication
+
+    if [[ $auto != -y ]]; then
+        echo
+        echo "当前已写入 $n 个公钥:"
+        print_keys
+        echo
+        warn "开启后只能用以上公钥对应的密钥登录，密码将无法登录"
+        warn "当前 SSH 连接不会断开。开启后请保持此窗口，新开一个 Termius 窗口测试能否登录"
+        read -rp "确认开启只允许密钥登录? [y/N]: " ans
+        [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+    fi
+
+    content="PubkeyAuthentication yes
+PasswordAuthentication no
+$kbdkey no
+PermitRootLogin prohibit-password"
+
+    if sshd_has_include; then mode=file; else mode=block; fi
+    apply_sshd_conf "$mode" "$KEY_ONLY_FILE" "$content" || return 1
+
+    pw=$(eff_get "$(sshd_effective)" passwordauthentication)
+    if [[ $pw != no && $mode == file ]]; then
+        # sshd_config 里在 Include 之前就设置了密码登录，改为写到 sshd_config 最前面
+        apply_sshd_conf block "" "$content" || return 1
+        pw=$(eff_get "$(sshd_effective)" passwordauthentication)
+    fi
+
+    if [[ $pw == no ]]; then
+        info "✅ 已开启只允许密钥登录，配置检查通过并已生效"
+        warn "请新开一个窗口用密钥登录测试，确认成功后再关闭当前窗口"
+    else
+        error "配置已写入，但密码登录实际仍为 $pw，可能被以下配置覆盖:"
+        show_setting_sources PasswordAuthentication
+        return 1
+    fi
+}
+
+ssh_password_login() {
+    need_root || return 1
+    local st ans eff mode
+    st=$(passwd -S root 2>/dev/null | awk '{ print $2 }')
+    if [[ $st == L || $st == LK || $st == NP ]]; then
+        warn "root 账号当前没有可用的密码，开启后仍无法用密码登录。可先运行 passwd 设置密码"
+    fi
+    read -rp "确认恢复密码登录? [y/N]: " ans
+    [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+
+    apply_sshd_conf file "" "" || return 1
+    eff=$(sshd_effective)
+    if [[ $(eff_get "$eff" passwordauthentication) != yes || $(eff_get "$eff" permitrootlogin) != yes ]]; then
+        # 系统其他配置仍禁止密码登录，写入一条明确开启的配置
+        if sshd_has_include; then mode=file; else mode=block; fi
+        apply_sshd_conf "$mode" "$PASSWORD_FILE" "PasswordAuthentication yes
+PermitRootLogin yes" || return 1
+        eff=$(sshd_effective)
+    fi
+
+    if [[ $(eff_get "$eff" passwordauthentication) == yes ]]; then
+        info "✅ 已恢复密码登录 (密钥登录同样可用)"
+    else
+        error "密码登录仍未开启，可能被以下配置覆盖:"
+        show_setting_sources PasswordAuthentication
+        return 1
+    fi
+}
+
+yesno() {
+    case $1 in
+        yes) printf '%s开启%s' "$GREEN" "$PLAIN" ;;
+        no)  printf '%s关闭%s' "$RED" "$PLAIN" ;;
+        *)   printf '%s' "${1:-未知}" ;;
+    esac
+}
+
+ssh_status() {
+    need_root || return 1
+    local f n eff pw kbd pub root ports dmode fmode err svc
+
+    f=$(auth_keys_file)
+    n=$(key_count)
+    printf '%s========== 公钥 ==========%s\n' "$BOLD" "$PLAIN"
+    printf '公钥文件: %s\n' "$f"
+    if (( n > 0 )); then
+        printf '写入情况: %s✔ 已写入 %d 个公钥%s\n' "$GREEN" "$n" "$PLAIN"
+        print_keys
+    else
+        printf '写入情况: %s✘ 没有公钥%s\n' "$RED" "$PLAIN"
+    fi
+    if [[ -f $f ]]; then
+        dmode=$(file_mode "${f%/*}"); fmode=$(file_mode "$f")
+        if [[ -n $dmode && -n $fmode ]]; then
+            if (( (8#$dmode & 8#022) || (8#$fmode & 8#022) )); then
+                printf '文件权限: %s✘ .ssh=%s authorized_keys=%s，权限过宽，sshd 会拒绝使用这些公钥%s\n' "$RED" "$dmode" "$fmode" "$PLAIN"
+            else
+                printf '文件权限: %s✔%s .ssh=%s authorized_keys=%s\n' "$GREEN" "$PLAIN" "$dmode" "$fmode"
+            fi
+        fi
+        grep -q 'Please login as' "$f" 2>/dev/null &&
+            warn "部分公钥带有云厂商的登录限制 (Please login as ...)，这些公钥不能直接登录 root"
+    fi
+
+    echo
+    printf '%s========== 登录方式 (当前生效的配置) ==========%s\n' "$BOLD" "$PLAIN"
+    eff=$(sshd_effective)
+    if [[ -z $eff ]]; then
+        error "无法读取 sshd 配置:"
+        "$(sshd_bin)" -t 2>&1 | sed 's/^/  /'
+        return 1
+    fi
+    pw=$(eff_get "$eff" passwordauthentication)
+    kbd=$(eff_get "$eff" kbdinteractiveauthentication)
+    [[ -z $kbd ]] && kbd=$(eff_get "$eff" challengeresponseauthentication)
+    pub=$(eff_get "$eff" pubkeyauthentication)
+    root=$(eff_get "$eff" permitrootlogin)
+    ports=$(awk '$1 == "port" { printf "%s%s", (n++ ? ", " : ""), $2 }' <<<"$eff")
+    printf 'SSH 端口: %s\n' "$ports"
+    printf '密钥登录: %s\n' "$(yesno "$pub")"
+    printf '密码登录: %s\n' "$(yesno "$pw")"
+    printf '键盘交互: %s\n' "$(yesno "$kbd")"
+    case $root in
+        yes) printf 'root 登录: 允许 (密码和密钥都可以)\n' ;;
+        prohibit-password|without-password) printf 'root 登录: 仅允许密钥\n' ;;
+        forced-commands-only) printf 'root 登录: 仅允许受限命令\n' ;;
+        no)  printf 'root 登录: %s禁止%s\n' "$RED" "$PLAIN" ;;
+        *)   printf 'root 登录: %s\n' "$root" ;;
+    esac
+
+    echo
+    printf '%s========== 配置与服务 ==========%s\n' "$BOLD" "$PLAIN"
+    if [[ -f $KEY_ONLY_FILE ]]; then
+        printf '只允许密钥: 已配置 (%s)\n' "$KEY_ONLY_FILE"
+    elif grep -qxF "$SSHD_MARK_BEGIN" "$SSHD_CONFIG" 2>/dev/null; then
+        printf 'portman 配置: 已写入 %s 顶部\n' "$SSHD_CONFIG"
+    elif [[ -f $PASSWORD_FILE ]]; then
+        printf '密码登录: 已由 portman 强制开启 (%s)\n' "$PASSWORD_FILE"
+    else
+        printf 'portman 配置: 无 (使用系统默认)\n'
+    fi
+    echo "密码登录相关设置 (按顺序，第一个生效):"
+    show_setting_sources PasswordAuthentication | grep . || echo "    (没有设置，默认开启)"
+    if err=$("$(sshd_bin)" -t 2>&1); then
+        printf '配置检查: %s✔ 通过%s\n' "$GREEN" "$PLAIN"
+    else
+        printf '配置检查: %s✘ 有错误%s %s\n' "$RED" "$PLAIN" "$err"
+    fi
+    if svc=$(ssh_service_state); then
+        printf 'SSH 服务: %s%s%s\n' "$GREEN" "$svc" "$PLAIN"
+    else
+        printf 'SSH 服务: %s%s%s\n' "$RED" "$svc" "$PLAIN"
+    fi
+
+    echo
+    printf '%s========== 结论 ==========%s\n' "$BOLD" "$PLAIN"
+    if (( n == 0 )) && [[ $pw == no ]]; then
+        printf '%s❌ 密码登录已关闭，但没有任何公钥！请不要断开当前连接，立即写入公钥或恢复密码登录%s\n' "$RED" "$PLAIN"
+    elif [[ $pub == yes && $pw == no && $kbd != yes ]] && (( n > 0 )); then
+        printf '%s✅ 只允许密钥登录，已生效%s\n' "$GREEN" "$PLAIN"
+    elif [[ $pw == no ]]; then
+        printf '%s⚠ 密码登录已关闭，但键盘交互登录仍开启，仍可能用密码登录%s\n' "$YELLOW" "$PLAIN"
+    elif (( n > 0 )); then
+        printf '%s⚠ 公钥已写入，但密码登录仍开启。可以使用「一键开启只允许密钥登录」%s\n' "$YELLOW" "$PLAIN"
+    else
+        printf '%s⚠ 还没有写入公钥，当前使用密码登录%s\n' "$YELLOW" "$PLAIN"
+    fi
+}
+
+ssh_menu() {
+    local c n pw
+    while true; do
+        clear 2>/dev/null
+        printf '%s===== SSH 密钥登录 =====%s\n' "$BOLD" "$PLAIN"
+        if is_root; then
+            n=$(key_count)
+            pw=$(eff_get "$(sshd_effective)" passwordauthentication)
+            printf '  当前: 公钥 %s 个 | 密码登录 %s\n\n' "$n" "$(yesno "$pw")"
+        fi
+        echo "  1. 查看详细状态 (公钥是否写入、配置是否生效)"
+        echo "  2. 写入公钥 (Termius / sshid.io / GitHub / 直接粘贴)"
+        echo "  3. 一键开启「只允许密钥登录」(关闭密码登录)"
+        echo "  4. 恢复密码登录"
+        echo "  0. 返回主菜单"
+        echo
+        read -rp "请选择 [0-4]: " c
+        echo
+        case $c in
+            1) ssh_status ;;
+            2) ssh_add_key ;;
+            3) ssh_key_only ;;
+            4) ssh_password_login ;;
+            0|q|"") return 0 ;;
+            *) error "无效选择" ;;
+        esac
+        echo
+        pause
+    done
+}
+
+# ---------------------------------------------------------------------------
 # 更新 / 卸载
 # ---------------------------------------------------------------------------
 download() {
@@ -1023,9 +1448,14 @@ portman v${VERSION} - VPS 端口查看与管理工具
   10. portman ip                     查看 IPv4 / IPv6 状态（地址、路由、能否上网）
   11. portman ipv6 off               禁用 IPv6，重启后保持
   12. portman ipv6 on                启用 IPv6，重启后保持
-  13. portman update                 更新到最新版本
-  14. portman uninstall              卸载 portman（不影响已有防火墙规则）
-  15. portman version                查看当前版本
+  13. portman ssh                    SSH 密钥登录管理菜单
+  14. portman ssh status             查看公钥是否写入、密码登录是否关闭、配置是否生效
+  15. portman ssh addkey <来源>      写入公钥，来源可以是 sshid.io 用户名 / 链接 / 公钥本身
+  16. portman ssh keyonly [-y]       只允许密钥登录（-y 跳过确认）
+  17. portman ssh password           恢复密码登录
+  18. portman update                 更新到最新版本
+  19. portman uninstall              卸载 portman（不影响已有防火墙规则）
+  20. portman version                查看当前版本
 
 端口写法:
   8080          单个端口
@@ -1037,6 +1467,9 @@ portman v${VERSION} - VPS 端口查看与管理工具
   portman open 80,443 tcp           放行 80 和 443 的 tcp
   portman open 10000-10100 both     放行 10000~10100 的 tcp 和 udp
   portman close 8080                关闭 8080/tcp
+  portman ssh addkey abc123         从 https://sshid.io/abc123 写入 Termius 公钥
+  portman ssh addkey abc123 && portman ssh keyonly -y
+                                    新服务器一条命令: 写入公钥并只允许密钥登录
 EOF
 }
 
@@ -1061,11 +1494,12 @@ menu() {
         echo "  8. 查看防火墙状态"
         echo "  9. 查看 IPv4 / IPv6 状态"
         echo " 10. 开启 / 关闭 IPv6"
-        echo " 11. 更新 portman"
-        echo " 12. 卸载 portman"
+        echo " 11. SSH 密钥登录 (写入公钥、只允许密钥登录)"
+        echo " 12. 更新 portman"
+        echo " 13. 卸载 portman"
         echo "  0. 退出"
         echo
-        read -rp "请选择 [0-12]: " c
+        read -rp "请选择 [0-13]: " c
         echo
         case $c in
             1) show_ports all ;;
@@ -1081,8 +1515,9 @@ menu() {
             8) show_firewall ;;
             9) show_ip_status ;;
             10) ipv6_menu ;;
-            11) update_self ;;
-            12) uninstall_self && exit 0 ;;
+            11) ssh_menu; continue ;;
+            12) update_self ;;
+            13) uninstall_self && exit 0 ;;
             0|q) exit 0 ;;
             *) error "无效选择" ;;
         esac
@@ -1112,6 +1547,14 @@ main() {
                 on)  ipv6_enable ;;
                 off) ipv6_disable ;;
                 *)   ipv6_menu ;;
+            esac ;;
+        ssh)
+            case ${2:-} in
+                status)       ssh_status ;;
+                addkey|key)   ssh_add_key "${*:3}" ;;
+                keyonly)      ssh_key_only "${3:-}" ;;
+                password)     ssh_password_login ;;
+                *)            ssh_menu ;;
             esac ;;
         update)          update_self ;;
         uninstall)       uninstall_self ;;

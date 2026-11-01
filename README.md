@@ -45,6 +45,11 @@ curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/instal
 | `portman ip` | 查看 IPv4 / IPv6 状态：是否启用、地址、默认路由、能否访问外网 |
 | `portman ipv6 off` | 禁用 IPv6，重启后保持 |
 | `portman ipv6 on` | 启用 IPv6，重启后保持 |
+| `portman ssh` | SSH 密钥登录管理菜单 |
+| `portman ssh status` | 查看公钥是否写入、密码登录是否关闭、配置是否生效 |
+| `portman ssh addkey <来源>` | 写入公钥：sshid.io 用户名、公钥链接或公钥本身 |
+| `portman ssh keyonly [-y]` | 只允许密钥登录（`-y` 跳过确认） |
+| `portman ssh password` | 恢复密码登录 |
 | `portman update` | 更新到最新版本 |
 | `portman uninstall` | 卸载 |
 
@@ -94,6 +99,21 @@ udp   51820   公网   未放行   -               0.0.0.0                   -
 - 当前通过 IPv6 连接 SSH，或机器没有 IPv4 时，会拒绝禁用，防止断连
 - `portman ipv6 on` 会删除该文件并立即启用；如果其他配置文件也在禁用 IPv6，会列出来提示
 - 若 IPv6 是被内核启动参数 `ipv6.disable=1` 禁用的，需要修改 GRUB，脚本会给出步骤
+
+## SSH 密钥登录
+
+菜单第 11 项，或 `portman ssh`：
+
+1. **写入公钥**：输入 Termius 的 sshid.io 用户名（如 `abc123`，即 `https://sshid.io/abc123`）、任意公钥链接（如 `https://github.com/用户名.keys`），或直接粘贴公钥。会校验格式、跳过已存在的公钥，并修正 `~/.ssh` 权限；上次的来源会被记住，下次直接回车即可。
+2. **只允许密钥登录**：没有公钥时会拒绝执行。写入 `/etc/ssh/sshd_config.d/00-key-only.conf`（不支持 `sshd_config.d` 的系统则写到 `sshd_config` 顶部），用 `sshd -t` 检查，失败自动回滚，通过后重载 sshd 并确认已生效。当前连接不会断开。
+3. **查看状态**：公钥数量和指纹、文件权限、当前生效的登录方式（读取 `sshd -T`）、哪些配置文件设置了密码登录、配置检查和服务状态，最后给出结论。
+4. **恢复密码登录**：删除上述配置；如果系统其他配置仍禁止密码登录，会写入一条明确开启的配置。
+
+新服务器一条命令完成（把 `abc123` 换成你的 sshid.io 用户名）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/install.sh) && portman ssh addkey abc123 && portman ssh keyonly -y
+```
 
 ## 注意
 

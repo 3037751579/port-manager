@@ -63,5 +63,6 @@ cat <<'EOF'
   9. portman fw            查看防火墙状态和规则
  10. portman ip            查看 IPv4 / IPv6 状态
  11. portman ipv6 off/on   关闭 / 开启 IPv6，重启后保持
- 12. portman help          查看全部命令和用法示例
+ 12. portman ssh           SSH 密钥登录：写入公钥、只允许密钥登录、查看状态
+ 13. portman help          查看全部命令和用法示例
 EOF
