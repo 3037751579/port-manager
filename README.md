@@ -50,6 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/instal
 | `portman ssh addkey <来源>` | 写入公钥：sshid.io 用户名、公钥链接或公钥本身 |
 | `portman ssh keyonly [-y]` | 只允许密钥登录（`-y` 跳过确认） |
 | `portman ssh password` | 恢复密码登录 |
+| `portman ssh log [小时]` | 登录记录：失败/探测次数、尝试最多的 IP 和用户名、最近成功登录（显示用的哪把密钥）、当前在线 |
 | `portman update` | 更新到最新版本 |
 | `portman uninstall` | 卸载 |
 

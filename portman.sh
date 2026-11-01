@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.4.1"
+VERSION="1.5.0"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -1314,6 +1314,153 @@ ssh_status() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# SSH 登录记录
+# ---------------------------------------------------------------------------
+# 日志来源: journal | /var/log/auth.log | /var/log/secure | none
+ssh_log_source() {
+    if has journalctl && journalctl -q -t sshd -t sshd-session -n 1 -o cat 2>/dev/null | grep -q .; then
+        echo journal
+    elif [[ -r /var/log/auth.log ]]; then
+        echo /var/log/auth.log
+    elif [[ -r /var/log/secure ]]; then
+        echo /var/log/secure
+    else
+        echo none
+    fi
+}
+
+# OpenSSH 9.8 起登录相关日志由 sshd-session 进程输出
+ssh_log_lines() {
+    if [[ $1 == journal ]]; then
+        journalctl -q -t sshd -t sshd-session --since "$2 hours ago" -o short-iso --no-pager 2>/dev/null
+    else
+        grep -E ' sshd(-session)?\[' "$1" 2>/dev/null
+    fi
+}
+
+# 分析日志，输出带标签的行 (制表符分隔):
+#   S 时间 用户 IP 方式 备注    成功登录
+#   I 次数 IP                   失败/探测最多的 IP
+#   U 次数 用户名               被尝试的用户名
+#   T 失败连接数 IP数 密码登录成功次数 首条时间 末条时间
+ssh_log_analyze() {
+    FPMAP="$1" LC_ALL=C awk '
+    BEGIN {
+        OFS = "\t"
+        n = split(ENVIRON["FPMAP"], a, "\n")
+        for (i = 1; i <= n; i++) { split(a[i], b, "|"); if (b[2] != "") fp[b[2]] = b[3] }
+    }
+    function ts(   t) {
+        if ($1 ~ /^[0-9][0-9][0-9][0-9]-/) { t = substr($1, 1, 19); sub("T", " ", t); return t }
+        return $1 " " $2 " " $3
+    }
+    { if (first == "") first = ts(); last = ts() }
+    / Accepted / {
+        m = ""; f = ""
+        for (i = 1; i <= NF; i++) {
+            if ($i == "Accepted") { m = $(i + 1); u = $(i + 3); ip = $(i + 5) }
+            if ($i ~ /^SHA256:/) f = $i
+        }
+        if (m == "publickey") { method = "密钥"; note = (f in fp) ? fp[f] : f }
+        else { method = (m == "password") ? "密码" : m; note = ""; pwok++ }
+        print "S", ts(), u, ip, method, note
+        next
+    }
+    /Failed |Invalid user |authenticating user |invalid user |maximum authentication attempts|Unable to negotiate|banner exchange|Did not receive identification|not allowed because|\[preauth\]/ {
+        ip = ""; pt = ""
+        for (i = 2; i < NF; i++)
+            if ($i == "port" && $(i - 1) ~ /^[0-9a-fA-F.:]+$/ && $(i - 1) ~ /[.:]/) { ip = $(i - 1); pt = $(i + 1); break }
+        if (ip == "") next
+        sub(/[^0-9].*/, "", pt)
+        k = ip " " pt
+        # 同一次连接会产生多行日志，按 IP+源端口 去重
+        if (!(k in conn)) { conn[k] = 1; nf++; if (!(ip in byip)) nip++; byip[ip]++ }
+        u = ""
+        for (i = 2; i < NF; i++) {
+            if ($i == "user" && ($(i - 1) == "Invalid" || $(i - 1) == "invalid" || $(i - 1) == "authenticating")) u = $(i + 1)
+            if ($i == "for" && $(i + 1) != "invalid" && $(i - 1) ~ /^(password|publickey|none)$/) u = $(i + 1)
+        }
+        if (u != "" && !((k, u) in seenu)) { seenu[k, u] = 1; users[u]++ }
+    }
+    END {
+        for (ip in byip) print "I", byip[ip], ip
+        for (u in users) print "U", users[u], u
+        print "T", nf + 0, nip + 0, pwok + 0, first, last
+    }'
+}
+
+ssh_login_log() {
+    need_root || return 1
+    local hours=${1:-24} src logs result total nip pwok first last me pw
+    [[ $hours =~ ^[0-9]+$ && $hours -gt 0 ]] || { error "小时数需要是正整数"; return 1; }
+
+    src=$(ssh_log_source)
+    if [[ $src == none ]]; then
+        error "找不到 SSH 日志 (journalctl、/var/log/auth.log、/var/log/secure 都不可用)"
+        return 1
+    fi
+    logs=$(ssh_log_lines "$src" "$hours")
+    result=$(ssh_log_analyze "$(list_keys)" <<<"$logs")
+    IFS=$'\t' read -r _ total nip pwok first last <<<"$(grep '^T' <<<"$result")"
+    me=$(awk '{ print $1 }' <<<"${SSH_CONNECTION:-}")
+
+    if [[ $src == journal ]]; then
+        printf '%s========== SSH 登录记录 (最近 %s 小时) ==========%s\n' "$BOLD" "$hours" "$PLAIN"
+        printf '日志来源: systemd journal\n'
+    else
+        printf '%s========== SSH 登录记录 ==========%s\n' "$BOLD" "$PLAIN"
+        printf '日志来源: %s (文件里的全部记录: %s ~ %s)\n' "$src" "${first:--}" "${last:--}"
+    fi
+    echo
+
+    printf '%s失败 / 探测连接:%s ' "$BOLD" "$PLAIN"
+    if (( total == 0 )); then
+        printf '%s0 次%s\n' "$GREEN" "$PLAIN"
+    else
+        printf '%s%d 次%s，来自 %d 个 IP\n' "$YELLOW" "$total" "$PLAIN" "$nip"
+        echo "尝试最多的 IP:"
+        grep '^I' <<<"$result" | sort -t$'\t' -k2,2nr | head -10 |
+            awk -F'\t' '{ printf "  %2d. %-20s %d 次\n", NR, $3, $2 }'
+        printf '被尝试的用户名: '
+        grep '^U' <<<"$result" | sort -t$'\t' -k2,2nr | head -10 |
+            awk -F'\t' '{ printf "%s%s(%d)", (NR > 1 ? "  " : ""), $3, $2 } END { print "" }'
+    fi
+    echo
+
+    printf '%s最近成功登录:%s\n' "$BOLD" "$PLAIN"
+    if grep -q '^S' <<<"$result"; then
+        grep '^S' <<<"$result" | tail -10 | awk -F'\t' -v me="$me" -v G="$GREEN" -v Y="$YELLOW" -v P="$PLAIN" '{
+            mark = ($4 == me) ? "  (当前连接)" : ""
+            color = ($5 == "密钥") ? G : Y
+            printf "  %s  %-6s %-16s %s%s%s %s%s\n", $2, $3, $4, color, $5, P, $6, mark
+        }'
+    else
+        echo "  (没有记录)"
+    fi
+    echo
+
+    printf '%s当前在线:%s\n' "$BOLD" "$PLAIN"
+    if has who && [[ -n $(who 2>/dev/null) ]]; then
+        who | sed 's/^/  /'
+    else
+        echo "  (没有)"
+    fi
+    echo
+
+    printf '%s结论:%s\n' "$BOLD" "$PLAIN"
+    pw=$(eff_get "$(sshd_effective)" passwordauthentication)
+    if [[ $pw == no ]]; then
+        printf '  %s✔ 密码登录已关闭，以上失败尝试都不可能成功，不需要 fail2ban%s\n' "$GREEN" "$PLAIN"
+    elif (( total > 0 )); then
+        printf '  %s⚠ 密码登录仍开启，并且有人在尝试登录，建议开启「只允许密钥登录」%s\n' "$YELLOW" "$PLAIN"
+    fi
+    if (( pwok > 0 )); then
+        printf '  %s⚠ 有 %d 次通过密码登录成功的记录，请确认是你本人%s\n' "$YELLOW" "$pwok" "$PLAIN"
+    fi
+    echo "  请确认「最近成功登录」里的 IP 都是你自己的"
+}
+
 ssh_menu() {
     local c n pw
     while true; do
@@ -1328,15 +1475,18 @@ ssh_menu() {
         echo "  2. 写入公钥 (Termius / sshid.io / GitHub / 直接粘贴)"
         echo "  3. 一键开启「只允许密钥登录」(关闭密码登录)"
         echo "  4. 恢复密码登录"
+        echo "  5. 查看登录记录 (失败尝试、成功登录、当前在线)"
         echo "  0. 返回主菜单"
         echo
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         echo
         case $c in
             1) ssh_status ;;
             2) ssh_add_key ;;
             3) ssh_key_only ;;
             4) ssh_password_login ;;
+            5) read -rp "查看最近多少小时 [默认 24]: " n
+               ssh_login_log "${n:-24}" ;;
             0|q|"") return 0 ;;
             *) error "无效选择" ;;
         esac
@@ -1458,9 +1608,10 @@ portman v${VERSION} - VPS 端口查看与管理工具
   15. portman ssh addkey <来源>      写入公钥，来源可以是 sshid.io 用户名 / 链接 / 公钥本身
   16. portman ssh keyonly [-y]       只允许密钥登录（-y 跳过确认）
   17. portman ssh password           恢复密码登录
-  18. portman update                 更新到最新版本
-  19. portman uninstall              卸载 portman（不影响已有防火墙规则）
-  20. portman version                查看当前版本
+  18. portman ssh log [小时]         查看登录记录：失败尝试、成功登录、当前在线（默认 24 小时）
+  19. portman update                 更新到最新版本
+  20. portman uninstall              卸载 portman（不影响已有防火墙规则）
+  21. portman version                查看当前版本
 
 端口写法:
   8080          单个端口
@@ -1563,6 +1714,7 @@ main() {
                 addkey|key)   ssh_add_key "${*:3}" ;;
                 keyonly)      ssh_key_only "${3:-}" ;;
                 password)     ssh_password_login ;;
+                log)          ssh_login_log "${3:-24}" ;;
                 *)            ssh_menu ;;
             esac ;;
         update)          update_self ;;
