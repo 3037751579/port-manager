@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -1400,14 +1400,19 @@ remove_shortcuts() {
 
 update_self() {
     need_root || return 1
-    local tmp
+    local tmp new
     tmp=$(mktemp)
     info "正在下载最新版本..."
     if download "$RAW_URL/portman.sh" "$tmp" && bash -n "$tmp"; then
         install -m 755 "$tmp" "$INSTALL_PATH"
         rm -f "$tmp"
         "$INSTALL_PATH" shortcut >/dev/null
-        info "已更新到 $("$INSTALL_PATH" version)"
+        new=$("$INSTALL_PATH" version)
+        if [[ $new == "portman v${VERSION}" ]]; then
+            info "已经是最新版本 ($new)。如果刚推送了新版本，GitHub 缓存可能要等几分钟"
+        else
+            info "已从 v${VERSION} 更新到 ${new#portman }"
+        fi
     else
         rm -f "$tmp"
         error "下载失败，请检查网络"
@@ -1516,7 +1521,11 @@ menu() {
             9) show_ip_status ;;
             10) ipv6_menu ;;
             11) ssh_menu; continue ;;
-            12) update_self ;;
+            12) if update_self; then
+                    # 用新版本替换当前进程，直接进入新菜单
+                    echo; pause
+                    exec "$INSTALL_PATH"
+                fi ;;
             13) uninstall_self && exit 0 ;;
             0|q) exit 0 ;;
             *) error "无效选择" ;;
