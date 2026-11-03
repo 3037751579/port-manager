@@ -51,6 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/instal
 | `portman ssh keyonly [-y]` | 只允许密钥登录（`-y` 跳过确认） |
 | `portman ssh password` | 恢复密码登录 |
 | `portman ssh keys` | 管理公钥：显示最近使用时间和当前连接所用的密钥，可删除、修改备注 |
+| `portman ssh label 指纹前缀=备注 ...` | 按指纹批量加备注，例如 `portman ssh label FkK2Q24cqy46=iPhone`。命令可在「管理公钥 → 生成批量备注命令」里自动生成，在多台服务器上执行即可统一备注 |
 | `portman ssh harden [-y]` | 安全加固：把其他配置文件里残留的 `PasswordAuthentication yes` 等改为关闭 |
 | `portman ssh log [小时]` | 登录记录：失败/探测次数、尝试最多的 IP 和用户名、最近成功登录（显示用的哪把密钥）、当前在线 |
 | `portman update` | 更新到最新版本 |

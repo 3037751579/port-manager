@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -1623,31 +1623,102 @@ ssh_delete_keys() {
     print_keys_detail
 }
 
+# 修改 authorized_keys 第 $1 行公钥的备注为 $2 (为空则清除)
+set_key_comment() {
+    local f line=$1 comment=$2 old prefix tmp
+    f=$(auth_keys_file)
+    old=$(sed -n "${line}p" "$f")
+    [[ $old =~ ^(.*(ssh-[a-z0-9-]+|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+)[[:space:]]+[A-Za-z0-9+/]+=*) ]] || return 1
+    prefix=${BASH_REMATCH[1]}
+    tmp=$(mktemp)
+    NEWLINE="$prefix${comment:+ $comment}" awk -v l="$line" 'NR == l { print ENVIRON["NEWLINE"]; next } { print }' \
+        "$f" >"$tmp"
+    cat "$tmp" >"$f"
+    rm -f "$tmp"
+}
+
+# 逐个询问每个公钥的备注，回车跳过
 ssh_rename_key() {
     need_root || return 1
-    local f sel line old prefix comment
+    local f e line type fp comment new changed=0 i=0
+    local -a entries=()
     f=$(auth_keys_file)
     echo "当前公钥:"
     print_keys_detail
     (( KEY_TOTAL > 0 )) || return 0
     echo
-    read -rp "要修改备注的编号 (直接回车取消): " sel
-    [[ -n $sel ]] || { info "已取消"; return 0; }
-    [[ $sel =~ ^[0-9]+$ ]] || { error "请输入单个编号"; return 1; }
-    line=$(pick_key_lines "$sel") || return 1
-    read -rp "新的备注 (例如 Termius-MacBook，直接回车清除备注): " comment
-    comment=$(tr -d '\r\n' <<<"$comment")
-
-    old=$(sed -n "${line}p" "$f")
-    if [[ ! $old =~ ^(.*(ssh-[a-z0-9-]+|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+)[[:space:]]+[A-Za-z0-9+/]+=*) ]]; then
-        error "无法解析这一行公钥"; return 1
-    fi
-    prefix=${BASH_REMATCH[1]}
+    echo "依次输入每个公钥的新备注 (如 iPhone / Windows / MacBook)，直接回车保持不变，输入 - 清除备注"
     cp -p "$f" "$f.bak-portman"
-    NEWLINE="$prefix${comment:+ $comment}" awk -v l="$line" 'NR == l { print ENVIRON["NEWLINE"]; next } { print }' \
-        "$f.bak-portman" >"$f"
-    info "备注已修改"
-    print_keys_detail
+    while IFS= read -r e; do entries+=("$e"); done <<<"$(key_entries)"
+    for e in "${entries[@]}"; do
+        IFS='|' read -r line type fp comment <<<"$e"
+        i=$((i + 1))
+        read -rp "  $i. ${fp:0:20}… 当前: $comment → " new || new=""
+        new=$(tr -d '\r\n' <<<"$new")
+        [[ -z $new ]] && continue
+        [[ $new == - ]] && new=""
+        set_key_comment "$line" "$new" && changed=$((changed + 1))
+    done
+    echo
+    if (( changed > 0 )); then
+        info "已修改 $changed 个备注 (原文件备份为 $f.bak-portman)"
+        print_keys_detail
+        echo
+        info "其他服务器想加上同样的备注，可以用「生成批量备注命令」"
+    else
+        info "没有修改"
+    fi
+}
+
+# 按指纹批量设置备注，用于在多台服务器上统一备注
+#   参数: 指纹前缀=备注 ...  例如 FkK2Q24cqy46=iPhone
+ssh_label_keys() {
+    need_root || return 1
+    local f arg pfx name entries line type fp comment hit applied=0
+    (( $# > 0 )) || { error "用法: portman ssh label 指纹前缀=备注 ...  (指纹前缀可在「管理公钥」里生成)"; return 1; }
+    f=$(auth_keys_file)
+    [[ -s $f ]] || { error "$f 中没有公钥"; return 1; }
+    cp -p "$f" "$f.bak-portman"
+    entries=$(key_entries)
+    for arg in "$@"; do
+        [[ $arg == *=* ]] || { warn "忽略无效参数: $arg"; continue; }
+        pfx=${arg%%=*}; name=${arg#*=}
+        pfx=${pfx#SHA256:}
+        if (( ${#pfx} < 6 )); then warn "指纹前缀太短 (至少 6 位): $pfx"; continue; fi
+        hit=""
+        while IFS='|' read -r line type fp comment; do
+            if [[ ${fp#SHA256:} == "$pfx"* ]]; then
+                set_key_comment "$line" "$name" && hit=1
+            fi
+        done <<<"$entries"
+        if [[ -n $hit ]]; then
+            printf '  %s✔%s %s → %s\n' "$GREEN" "$PLAIN" "$pfx" "$name"; applied=$((applied + 1))
+        else
+            printf '  %s-%s %s 这台服务器上没有这个公钥，跳过\n' "$YELLOW" "$PLAIN" "$pfx"
+        fi
+    done
+    info "已设置 $applied 个备注"
+}
+
+# 根据当前服务器上已有的备注，生成可在其他服务器执行的批量备注命令
+ssh_label_export() {
+    local cmd="portman ssh label" n=0 line type fp comment short
+    while IFS='|' read -r line type fp comment; do
+        [[ -z $fp || $fp == - || $comment == "(无备注)" ]] && continue
+        short=${fp#SHA256:}; short=${short:0:12}
+        cmd+=" $(printf '%q' "$short=$comment")"
+        n=$((n + 1))
+    done <<<"$(key_entries)"
+    if (( n == 0 )); then
+        warn "当前没有带备注的公钥，请先用「修改备注」给公钥起名"
+        return 1
+    fi
+    echo "在其他服务器上执行下面这条命令，即可给相同的公钥加上同样的备注:"
+    echo
+    printf '  %s%s%s\n' "$CYAN" "$cmd" "$PLAIN"
+    echo
+    echo "可以存成 Termius 代码片段；新服务器可以接在写入公钥之后:"
+    printf '  portman ssh addkey <sshid用户名> && %s && portman ssh keyonly -y\n' "$cmd"
 }
 
 ssh_keys_menu() {
@@ -1659,16 +1730,18 @@ ssh_keys_menu() {
         print_keys_detail
         echo
         echo "  1. 删除公钥"
-        echo "  2. 修改备注"
+        echo "  2. 修改备注 (逐个输入，一次改完)"
         echo "  3. 写入新公钥"
+        echo "  4. 生成批量备注命令 (在其他服务器上一键加同样的备注)"
         echo "  0. 返回"
         echo
-        read -rp "请选择 [0-3]: " c
+        read -rp "请选择 [0-4]: " c
         echo
         case $c in
             1) ssh_delete_keys ;;
             2) ssh_rename_key ;;
             3) ssh_add_key ;;
+            4) ssh_label_export ;;
             0|q|"") return 0 ;;
             *) error "无效选择" ;;
         esac
@@ -1892,6 +1965,8 @@ portman v${VERSION} - VPS 端口查看与管理工具
   18. portman ssh log [小时]         查看登录记录：失败尝试、成功登录、当前在线（默认 24 小时）
   19. portman ssh keys               管理公钥：查看最近使用时间、删除、修改备注
   20. portman ssh harden [-y]        安全加固：把其他配置文件里残留的密码登录设置改为关闭
+      portman ssh label 指纹前缀=备注 ...
+                                     按指纹批量加备注，命令可在「管理公钥」里自动生成
   21. portman update                 更新到最新版本
   22. portman uninstall              卸载 portman（不影响已有防火墙规则）
   23. portman version                查看当前版本
@@ -2000,6 +2075,7 @@ main() {
                 log)          ssh_login_log "${3:-24}" ;;
                 keys)         ssh_keys_menu ;;
                 delkey)       ssh_delete_keys ;;
+                label)        shift 2; ssh_label_keys "$@" ;;
                 harden)       ssh_harden "${3:-}" ;;
                 *)            ssh_menu ;;
             esac ;;
