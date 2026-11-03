@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.5.1"
+VERSION="1.6.0"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -968,22 +968,30 @@ sshd_effective() {
 
 eff_get() { awk -v k="$2" '$1 == k { print $2; exit }' <<<"$1"; }
 
-# 列出 authorized_keys 里的公钥，每行: 类型|指纹|备注
-list_keys() {
-    local f
+# 逐行解析 authorized_keys，每个公钥输出: 行号|类型|指纹|备注
+key_entries() {
+    local f n=0 line out
     f=$(auth_keys_file)
     [[ -s $f ]] || return 0
-    if has ssh-keygen; then
-        ssh-keygen -lf "$f" 2>/dev/null | awk '{
-            type = $NF; gsub(/[()]/, "", type); c = ""
-            for (i = 3; i < NF; i++) c = c (c == "" ? "" : " ") $i
-            print type "|" $2 "|" (c == "" ? "-" : c)
-        }'
-    else
-        grep -oE '(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/]+=*( [^ ].*)?$' "$f" |
-            awk '{ c = ""; for (i = 3; i <= NF; i++) c = c (c == "" ? "" : " ") $i; print $1 "|-|" (c == "" ? "-" : c) }'
-    fi
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+        if has ssh-keygen; then
+            out=$(ssh-keygen -lf /dev/stdin <<<"$line" 2>/dev/null) || continue
+            awk -v n="$n" '{
+                type = $NF; gsub(/[()]/, "", type); c = ""
+                for (i = 3; i < NF; i++) c = c (c == "" ? "" : " ") $i
+                if (c == "" || c == "no comment") c = "(无备注)"
+                print n "|" type "|" $2 "|" c; exit
+            }' <<<"$out"
+        elif [[ $line =~ (ssh-[a-z0-9-]+|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+)[[:space:]]+[A-Za-z0-9+/]+=*([[:space:]]+(.*))? ]]; then
+            echo "$n|${BASH_REMATCH[1]}|-|${BASH_REMATCH[3]:-(无备注)}"
+        fi
+    done <"$f"
 }
+
+# 每行: 类型|指纹|备注
+list_keys() { key_entries | cut -d'|' -f2-; }
 
 key_count() { list_keys | grep -c . ; }
 
@@ -1068,12 +1076,25 @@ apply_sshd_conf() {
     return 0
 }
 
-# 哪些配置文件设置了某个选项，例如 PasswordAuthentication
-show_setting_sources() {
-    local files=("$SSHD_CONFIG")
-    [[ -d $SSHD_DIR ]] && files+=("$SSHD_DIR"/*.conf)
-    grep -HnEi "^[[:space:]]*$1[[:space:]]" "${files[@]}" 2>/dev/null | sed 's/^/    /'
+# 按 sshd 实际读取顺序 (Include 处展开 sshd_config.d) 列出设置某个选项的位置
+#   输出: 文件:行号:内容
+ordered_setting_sources() {
+    local key=$1 item f
+    awk -v k="$key" -v file="$SSHD_CONFIG" '
+        tolower($1) == "include" && $0 ~ /sshd_config\.d\// { print "@INCLUDE"; next }
+        tolower($1) == tolower(k) { print file ":" NR ":" $0 }
+    ' "$SSHD_CONFIG" 2>/dev/null | while IFS= read -r item; do
+        if [[ $item == @INCLUDE ]]; then
+            for f in "$SSHD_DIR"/*.conf; do
+                [[ -f $f ]] && grep -HnEi "^[[:space:]]*$key[[:space:]]" "$f"
+            done
+        else
+            echo "$item"
+        fi
+    done
 }
+
+show_setting_sources() { ordered_setting_sources "$1" | sed 's/^/    /'; }
 
 ssh_add_key() {
     need_root || return 1
@@ -1190,6 +1211,11 @@ PermitRootLogin prohibit-password"
 
     if [[ $pw == no ]]; then
         info "✅ 已开启只允许密钥登录，配置检查通过并已生效"
+        if [[ -n $(ssh_risks) ]]; then
+            echo
+            warn "发现其他配置文件仍写着开启密码登录 (目前被覆盖，但属于隐患)"
+            ssh_harden "$auto"
+        fi
         warn "请新开一个窗口用密钥登录测试，确认成功后再关闭当前窗口"
     else
         error "配置已写入，但密码登录实际仍为 $pw，可能被以下配置覆盖:"
@@ -1237,7 +1263,7 @@ yesno() {
 
 ssh_status() {
     need_root || return 1
-    local f n eff pw kbd pub root ports dmode fmode err svc
+    local f n eff pw kbd pub root ports dmode fmode err svc risks ans
 
     f=$(auth_keys_file)
     n=$(key_count)
@@ -1299,8 +1325,12 @@ ssh_status() {
     else
         printf 'portman 配置: 无 (使用系统默认)\n'
     fi
-    echo "密码登录相关设置 (按顺序，第一个生效):"
-    show_setting_sources PasswordAuthentication | grep . || echo "    (没有设置，默认开启)"
+    echo "密码登录相关设置 (按 sshd 实际读取顺序，第一个生效):"
+    ordered_setting_sources PasswordAuthentication | awk -v G="$GREEN" -v Y="$YELLOW" -v P="$PLAIN" '{
+        if (NR == 1) { print "    " $0 "  " G "← 生效" P; next }
+        if (tolower($0) ~ /[ \t]yes[ \t]*$/) print "    " $0 "  " Y "← 被覆盖，有隐患" P
+        else print "    " $0 "  (被覆盖)"
+    } END { if (NR == 0) print "    (没有设置，默认开启)" }'
     if err=$("$(sshd_bin)" -t 2>&1); then
         printf '配置检查: %s✔ 通过%s\n' "$GREEN" "$PLAIN"
     else
@@ -1318,6 +1348,16 @@ ssh_status() {
         printf '%s❌ 密码登录已关闭，但没有任何公钥！请不要断开当前连接，立即写入公钥或恢复密码登录%s\n' "$RED" "$PLAIN"
     elif [[ $pub == yes && $pw == no && $kbd != yes ]] && (( n > 0 )); then
         printf '%s✅ 只允许密钥登录，已生效%s\n' "$GREEN" "$PLAIN"
+        risks=$(ssh_risks)
+        if [[ -n $risks ]] && key_only_active; then
+            printf '%s⚠ 但有 %d 处隐患: 其他配置文件仍写着开启密码登录，目前被覆盖。%s\n' \
+                "$YELLOW" "$(wc -l <<<"$risks" | tr -d ' ')" "$PLAIN"
+            printf '%s  一旦 00-key-only.conf 被删除或系统重新配置，密码登录会悄悄恢复%s\n' "$YELLOW" "$PLAIN"
+            sed 's/^/    /' <<<"$risks"
+            echo
+            read -rp "是否现在加固 (把这些设置改为关闭)? [y/N]: " ans
+            [[ $ans == [yY] ]] && ssh_harden -y
+        fi
     elif [[ $pw == no ]]; then
         printf '%s⚠ 密码登录已关闭，但键盘交互登录仍开启，仍可能用密码登录%s\n' "$YELLOW" "$PLAIN"
     elif (( n > 0 )); then
@@ -1474,6 +1514,230 @@ ssh_login_log() {
     echo "  请确认「最近成功登录」里的 IP 都是你自己的"
 }
 
+# ---------------------------------------------------------------------------
+# 公钥管理
+# ---------------------------------------------------------------------------
+# 日志中的公钥登录记录，每行: 时间|客户端IP|客户端端口|指纹
+key_login_events() {
+    local src
+    src=$(ssh_log_source)
+    case $src in
+        none) return 0 ;;
+        journal) journalctl -q -t sshd -t sshd-session -o short-iso --no-pager 2>/dev/null ;;
+        *) grep -E ' sshd(-session)?\[' "$src" 2>/dev/null ;;
+    esac | grep 'Accepted publickey' | awk '{
+        t = $1
+        if (t ~ /^[0-9][0-9][0-9][0-9]-/) { t = substr(t, 1, 16); sub("T", " ", t) } else t = $1 " " $2 " " $3
+        ip = ""; pt = ""; f = ""
+        for (i = 1; i <= NF; i++) {
+            if ($i == "from") ip = $(i + 1)
+            if ($i == "port" && pt == "") pt = $(i + 1)
+            if ($i ~ /^SHA256:/) f = $i
+        }
+        if (f != "") print t "|" ip "|" pt "|" f
+    }'
+}
+
+# 显示带编号的公钥列表，标出最近使用时间和当前连接所用的密钥
+# 设置全局变量 KEY_LINES (编号对应的文件行号) 和 KEY_TOTAL
+print_keys_detail() {
+    local events cur me_ip me_port
+    events=$(key_login_events)
+    read -r me_ip me_port _ <<<"${SSH_CONNECTION:-}"
+    cur=""
+    [[ -n $me_port ]] && cur=$(awk -F'|' -v ip="$me_ip" -v pt="$me_port" '$2 == ip && $3 == pt { f = $4 } END { print f }' <<<"$events")
+    KEY_LINES=$(key_entries | cut -d'|' -f1 | tr '\n' ' ')
+    KEY_TOTAL=$(wc -w <<<"$KEY_LINES" | tr -d ' ')
+    if (( KEY_TOTAL == 0 )); then
+        echo "  (没有公钥)"; return
+    fi
+    { echo "$events"; echo "--"; key_entries; } | awk -F'|' -v cur="$cur" \
+        -v C="$CYAN" -v G="$GREEN" -v Y="$YELLOW" -v P="$PLAIN" '
+        $0 == "--" { phase = 1; next }
+        phase == 0 { if ($4 != "") last[$4] = $1; next }
+        {
+            used = ($3 in last) ? "最近使用 " last[$3] : "日志中没有使用记录"
+            mark = ($3 == cur && cur != "") ? "  " G "← 当前连接正在使用" P : ""
+            printf "  %d. %s%-8s%s %s  %s%s%s\n     %s%s\n", ++k, C, $2, P, $3, Y, $4, P, used, mark
+        }'
+}
+
+# 把 "1,3" 这样的编号转为 authorized_keys 的行号 (从大到小，方便删除)
+pick_key_lines() {
+    local sel=${1// /} tok lines=() i
+    local -a map
+    read -ra map <<<"$KEY_LINES"
+    [[ -n $sel ]] || return 1
+    IFS=',' read -ra toks <<<"$sel"
+    for tok in "${toks[@]}"; do
+        if [[ ! $tok =~ ^[0-9]+$ ]] || (( tok < 1 || tok > KEY_TOTAL )); then
+            error "无效的编号: $tok (可选 1-$KEY_TOTAL)"; return 1
+        fi
+        lines+=("${map[tok - 1]}")
+    done
+    printf '%s\n' "${lines[@]}" | sort -rnu
+}
+
+ssh_delete_keys() {
+    need_root || return 1
+    local f sel lines n remain pw cur_fp cur_hit="" ans line me_ip me_port
+    f=$(auth_keys_file)
+    echo "当前公钥:"
+    print_keys_detail
+    (( KEY_TOTAL > 0 )) || return 0
+    echo
+    read -rp "输入要删除的编号 (多个用逗号分隔，如 2,3；直接回车取消): " sel
+    [[ -n $sel ]] || { info "已取消"; return 0; }
+    lines=$(pick_key_lines "$sel") || return 1
+    n=$(grep -c . <<<"$lines")
+    remain=$((KEY_TOTAL - n))
+
+    pw=$(eff_get "$(sshd_effective)" passwordauthentication)
+    if (( remain == 0 )) && [[ $pw == no ]]; then
+        error "密码登录已关闭，删除全部公钥后将无法登录服务器，已拒绝。请至少保留一个公钥"
+        return 1
+    fi
+    (( remain == 0 )) && warn "删除后将没有任何公钥，只能用密码登录"
+
+    # 检查是否包含当前连接使用的密钥
+    read -r me_ip me_port _ <<<"${SSH_CONNECTION:-}"
+    if [[ -n ${me_port:-} ]]; then
+        cur_fp=$(key_login_events | awk -F'|' -v ip="$me_ip" -v pt="$me_port" '$2 == ip && $3 == pt { f = $4 } END { print f }')
+        for line in $lines; do
+            [[ -n $cur_fp && $(key_entries | awk -F'|' -v l="$line" '$1 == l { print $3 }') == "$cur_fp" ]] && cur_hit=1
+        done
+    fi
+    if [[ -n $cur_hit ]]; then
+        warn "其中包含你当前连接正在使用的密钥！当前连接不会断开，但之后将无法再用它登录"
+        read -rp "确定删除请输入 yes: " ans
+        [[ $ans == yes ]] || { info "已取消"; return 0; }
+    else
+        read -rp "确认删除这 $n 个公钥? [y/N]: " ans
+        [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+    fi
+
+    cp -p "$f" "$f.bak-portman"
+    for line in $lines; do sed -i "${line}d" "$f"; done
+    info "已删除 $n 个公钥 (原文件备份为 $f.bak-portman)"
+    echo "剩余公钥:"
+    print_keys_detail
+}
+
+ssh_rename_key() {
+    need_root || return 1
+    local f sel line old prefix comment
+    f=$(auth_keys_file)
+    echo "当前公钥:"
+    print_keys_detail
+    (( KEY_TOTAL > 0 )) || return 0
+    echo
+    read -rp "要修改备注的编号 (直接回车取消): " sel
+    [[ -n $sel ]] || { info "已取消"; return 0; }
+    [[ $sel =~ ^[0-9]+$ ]] || { error "请输入单个编号"; return 1; }
+    line=$(pick_key_lines "$sel") || return 1
+    read -rp "新的备注 (例如 Termius-MacBook，直接回车清除备注): " comment
+    comment=$(tr -d '\r\n' <<<"$comment")
+
+    old=$(sed -n "${line}p" "$f")
+    if [[ ! $old =~ ^(.*(ssh-[a-z0-9-]+|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+)[[:space:]]+[A-Za-z0-9+/]+=*) ]]; then
+        error "无法解析这一行公钥"; return 1
+    fi
+    prefix=${BASH_REMATCH[1]}
+    cp -p "$f" "$f.bak-portman"
+    NEWLINE="$prefix${comment:+ $comment}" awk -v l="$line" 'NR == l { print ENVIRON["NEWLINE"]; next } { print }' \
+        "$f.bak-portman" >"$f"
+    info "备注已修改"
+    print_keys_detail
+}
+
+ssh_keys_menu() {
+    local c
+    while true; do
+        clear 2>/dev/null
+        printf '%s===== 管理公钥 =====%s\n' "$BOLD" "$PLAIN"
+        printf '公钥文件: %s\n\n' "$(auth_keys_file)"
+        print_keys_detail
+        echo
+        echo "  1. 删除公钥"
+        echo "  2. 修改备注"
+        echo "  3. 写入新公钥"
+        echo "  0. 返回"
+        echo
+        read -rp "请选择 [0-3]: " c
+        echo
+        case $c in
+            1) ssh_delete_keys ;;
+            2) ssh_rename_key ;;
+            3) ssh_add_key ;;
+            0|q|"") return 0 ;;
+            *) error "无效选择" ;;
+        esac
+        echo
+        pause
+    done
+}
+
+# ---------------------------------------------------------------------------
+# 安全隐患检测与加固
+#   只允许密钥登录靠 00-key-only.conf 抢在最前面生效。其他文件里如果还写着
+#   PasswordAuthentication yes 等，一旦 00-key-only.conf 被删，密码登录就会悄悄恢复。
+# ---------------------------------------------------------------------------
+# 输出: 文件:行号:内容
+ssh_risks() {
+    local files=("$SSHD_CONFIG")
+    [[ -d $SSHD_DIR ]] && files+=("$SSHD_DIR"/*.conf)
+    grep -HnEi '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)[[:space:]]+yes' \
+        "${files[@]}" 2>/dev/null | grep -vF -e "$KEY_ONLY_FILE:" -e "$PASSWORD_FILE:"
+}
+
+key_only_active() {
+    [[ -f $KEY_ONLY_FILE ]] || grep -qxF "$SSHD_MARK_BEGIN" "$SSHD_CONFIG" 2>/dev/null
+}
+
+ssh_harden() {
+    need_root || return 1
+    local auto=${1:-} risks files f b err ans
+    if ! key_only_active; then
+        error "还没有开启「只允许密钥登录」，请先开启后再加固"
+        return 1
+    fi
+    risks=$(ssh_risks)
+    if [[ -z $risks ]]; then
+        info "没有发现隐患，其他配置文件里没有开启密码登录的设置"
+        return 0
+    fi
+
+    echo "以下设置目前被 portman 的配置覆盖，暂时不生效。"
+    echo "但如果 00-key-only.conf 被删除或系统重新配置，它们会让密码登录悄悄恢复:"
+    sed 's/^/    /' <<<"$risks"
+    echo
+    echo "加固会把它们改为: PasswordAuthentication / KbdInteractiveAuthentication no，PermitRootLogin prohibit-password"
+    if [[ $auto != -y ]]; then
+        read -rp "确认加固? [y/N]: " ans
+        [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+    fi
+
+    b=$(sshd_bin) || { error "未找到 sshd"; return 1; }
+    files=$(cut -d: -f1 <<<"$risks" | sort -u)
+    for f in $files; do
+        cp -p "$f" "$f.bak-portman"
+        awk '{
+            l = tolower($0)
+            if (l ~ /^[ \t]*(passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication)[ \t]+yes/) sub(/[Yy][Ee][Ss]/, "no")
+            else if (l ~ /^[ \t]*permitrootlogin[ \t]+yes/) sub(/[Yy][Ee][Ss]/, "prohibit-password")
+            print
+        }' "$f.bak-portman" >"$f"
+    done
+
+    if ! err=$("$b" -t 2>&1); then
+        for f in $files; do cat "$f.bak-portman" >"$f"; done
+        error "sshd 配置检查失败，已自动回滚: $err"
+        return 1
+    fi
+    reload_sshd || warn "sshd 重新加载失败，请手动执行: systemctl restart ssh"
+    info "✅ 加固完成，已修改 $(wc -l <<<"$risks" | tr -d ' ') 处设置。原文件备份为 *.bak-portman"
+}
+
 ssh_menu() {
     local c n pw
     while true; do
@@ -1489,9 +1753,11 @@ ssh_menu() {
         echo "  3. 一键开启「只允许密钥登录」(关闭密码登录)"
         echo "  4. 恢复密码登录"
         echo "  5. 查看登录记录 (失败尝试、成功登录、当前在线)"
+        echo "  6. 管理公钥 (查看、删除、修改备注)"
+        echo "  7. 安全加固 (清除其他配置文件里残留的密码登录设置)"
         echo "  0. 返回主菜单"
         echo
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-7]: " c
         echo
         case $c in
             1) ssh_status ;;
@@ -1500,6 +1766,8 @@ ssh_menu() {
             4) ssh_password_login ;;
             5) read -rp "查看最近多少小时 [默认 24]: " n
                ssh_login_log "${n:-24}" ;;
+            6) ssh_keys_menu; continue ;;
+            7) ssh_harden ;;
             0|q|"") return 0 ;;
             *) error "无效选择" ;;
         esac
@@ -1622,9 +1890,11 @@ portman v${VERSION} - VPS 端口查看与管理工具
   16. portman ssh keyonly [-y]       只允许密钥登录（-y 跳过确认）
   17. portman ssh password           恢复密码登录
   18. portman ssh log [小时]         查看登录记录：失败尝试、成功登录、当前在线（默认 24 小时）
-  19. portman update                 更新到最新版本
-  20. portman uninstall              卸载 portman（不影响已有防火墙规则）
-  21. portman version                查看当前版本
+  19. portman ssh keys               管理公钥：查看最近使用时间、删除、修改备注
+  20. portman ssh harden [-y]        安全加固：把其他配置文件里残留的密码登录设置改为关闭
+  21. portman update                 更新到最新版本
+  22. portman uninstall              卸载 portman（不影响已有防火墙规则）
+  23. portman version                查看当前版本
 
 端口写法:
   8080          单个端口
@@ -1728,6 +1998,9 @@ main() {
                 keyonly)      ssh_key_only "${3:-}" ;;
                 password)     ssh_password_login ;;
                 log)          ssh_login_log "${3:-24}" ;;
+                keys)         ssh_keys_menu ;;
+                delkey)       ssh_delete_keys ;;
+                harden)       ssh_harden "${3:-}" ;;
                 *)            ssh_menu ;;
             esac ;;
         update)          update_self ;;

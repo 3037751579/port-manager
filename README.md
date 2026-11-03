@@ -50,6 +50,8 @@ curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/instal
 | `portman ssh addkey <来源>` | 写入公钥：sshid.io 用户名、公钥链接或公钥本身 |
 | `portman ssh keyonly [-y]` | 只允许密钥登录（`-y` 跳过确认） |
 | `portman ssh password` | 恢复密码登录 |
+| `portman ssh keys` | 管理公钥：显示最近使用时间和当前连接所用的密钥，可删除、修改备注 |
+| `portman ssh harden [-y]` | 安全加固：把其他配置文件里残留的 `PasswordAuthentication yes` 等改为关闭 |
 | `portman ssh log [小时]` | 登录记录：失败/探测次数、尝试最多的 IP 和用户名、最近成功登录（显示用的哪把密钥）、当前在线 |
 | `portman update` | 更新到最新版本 |
 | `portman uninstall` | 卸载 |
@@ -109,6 +111,8 @@ udp   51820   公网   未放行   -               0.0.0.0                   -
 2. **只允许密钥登录**：没有公钥时会拒绝执行。写入 `/etc/ssh/sshd_config.d/00-key-only.conf`（不支持 `sshd_config.d` 的系统则写到 `sshd_config` 顶部），用 `sshd -t` 检查，失败自动回滚，通过后重载 sshd 并确认已生效。当前连接不会断开。
 3. **查看状态**：公钥数量和指纹、文件权限、当前生效的登录方式（读取 `sshd -T`）、哪些配置文件设置了密码登录、配置检查和服务状态，最后给出结论。
 4. **恢复密码登录**：删除上述配置；如果系统其他配置仍禁止密码登录，会写入一条明确开启的配置。
+5. **管理公钥**：列出每个公钥的指纹、备注、最近使用时间，并标出当前连接正在用的那个。删除前会备份；密码登录已关闭时禁止删光全部公钥，删除当前正在用的公钥需要输入 `yes`。
+6. **安全加固**：云厂商常在 `sshd_config.d/50-cloud-init.conf` 等文件里写 `PasswordAuthentication yes`。只允许密钥登录时它们被 `00-key-only.conf` 覆盖，但一旦该文件被删，密码登录就会悄悄恢复。状态页会标出这些隐患并询问是否加固；开启只允许密钥登录时也会自动检查。加固前备份为 `*.bak-portman`，`sshd -t` 失败自动回滚。
 
 新服务器一条命令完成（把 `abc123` 换成你的 sshid.io 用户名）：
 
