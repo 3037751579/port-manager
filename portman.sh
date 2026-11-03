@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -264,8 +264,20 @@ show_ports() {
                 cell(s, 16, ""), cell(A[k], 26, ""), (PR[k] == "" ? "-" : PR[k])
         }
         if (shown == 0) {
-            if (mode == "all" || mode == "public") print "  (没有找到监听中的端口)"
-            else print "  端口 " mode " 当前没有程序在监听"
+            if (mode == "all" || mode == "public") { print "  (没有找到监听中的端口)"; exit }
+            print "  端口 " mode " 当前没有程序在监听，所以外部无论如何都连不上"
+            # 没有程序监听时，单独说明防火墙对这个端口的态度
+            printf "  防火墙对该端口:"
+            split("tcp udp", pr, " ")
+            for (i = 1; i <= 2; i++) {
+                if (fw == "unknown" || fw == "nftables") st = "未知"
+                else if (fw == "none") st = Y "无防火墙" P
+                else if (fw_allows(pr[i], mode + 0)) st = G "已放行 (有放行规则)" P
+                else if (defopen) st = Y "默认放行 (没有规则，但防火墙不拦截)" P
+                else st = R "未放行 (会被拦截)" P
+                printf "  %s %s", pr[i], st
+            }
+            print ""
             exit
         }
         printf "\n共 %d 个监听项，其中 %d 个对公网监听", shown, npub
@@ -275,7 +287,8 @@ show_ports() {
 
     printf '防火墙: %s' "$(firewall_name "$fw")"
     if (( defopen )) && [[ $fw != none ]]; then
-        printf '  %s(入站默认放行：所有端口都能从外部访问)%s' "$YELLOW" "$PLAIN"
+        printf '  %s(入站默认放行：防火墙不拦截任何端口，有程序监听的端口外部都能访问)%s' "$YELLOW" "$PLAIN"
+        printf '\n%s如需拦截没在使用的端口，请用主菜单第 6 项「一键关闭其他端口」%s' "$YELLOW" "$PLAIN"
     elif [[ $fw == ufw || $fw == firewalld || $fw == iptables ]]; then
         printf '  %s(入站默认拒绝：只有已放行的端口能访问)%s' "$GREEN" "$PLAIN"
     fi
