@@ -32,8 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/instal
 
 | 命令 | 说明 |
 | --- | --- |
-| `portman list` | 查看所有监听端口 |
-| `portman public` | 只看对公网监听的端口 |
+| `portman list` | 查看所有端口：正在监听的，以及防火墙已放行但未使用的 |
+| `portman public` | 只看对公网开放的端口（含已放行但未使用的） |
 | `portman check 80` | 查询指定端口 |
 | `portman open 8080` | 放行端口（默认 tcp） |
 | `portman open 80,443 both` | 同时放行 tcp 和 udp |

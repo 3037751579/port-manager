@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/3037751579/port-manager
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 REPO="3037751579/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
@@ -236,17 +236,44 @@ show_ports() {
         if (!is_local(addr)) PUB[k] = 1
     }
     END {
+        # 防火墙放行了但没有程序监听的端口也列出来
+        if (mode == "all" || mode == "public") {
+            for (r = 1; r <= nal; r++) {
+                if (lo[r] == 1 && hi[r] == 65535) continue
+                if (ap[r] == "any") np = split("tcp udp", rp, " ")
+                else { np = 1; rp[1] = ap[r] }
+                label = (lo[r] == hi[r]) ? lo[r] : lo[r] "-" hi[r]
+                for (q = 1; q <= np; q++) {
+                    k = rp[q] "/" label
+                    if (k in seen) continue
+                    seen[k] = 1; cnt++; key[cnt] = k
+                    KP[k] = rp[q]; KN[k] = lo[r]; KL[k] = label; UN[k] = 1
+                }
+            }
+        }
+        pw = 8
+        for (k in KL) if (length(KL[k]) + 1 > pw) pw = length(KL[k]) + 1
         # 按端口号、协议排序
         for (i = 2; i <= cnt; i++) {
             v = key[i]; j = i - 1
             while (j > 0 && (KN[key[j]] > KN[v] || (KN[key[j]] == KN[v] && key[j] > v))) { key[j + 1] = key[j]; j-- }
             key[j + 1] = v
         }
-        printf "%s%s%s%s%s%s%s%s\n", B, cell("协议", 6, ""), cell("端口", 8, ""), cell("范围", 7, ""),
+        printf "%s%s%s%s%s%s%s%s\n", B, cell("协议", 6, ""), cell("端口", pw, ""), cell("范围", 7, ""),
             cell("防火墙", 9, ""), cell("服务", 16, ""), cell("监听地址", 26, ""), "进程(PID)" P
         shown = 0; npub = 0; nblock = 0
         for (i = 1; i <= cnt; i++) {
             k = key[i]; proto = KP[k]; port = KN[k]
+            if (UN[k]) {
+                nun++
+                s = (KL[k] ~ /-/) ? "-" : svc[port "/" proto]
+                if (s == "" && KL[k] !~ /-/) s = common[port]
+                if (s == "") s = "-"
+                printf "%s%s%s%s%s%s%s\n", cell(proto, 6, C), cell(KL[k], pw, ""), cell("-", 7, ""),
+                    cell("已放行", 9, G), cell(s, 16, ""), cell("-", 26, ""),
+                    Y ((KL[k] ~ /-/) ? "端口范围" : "未使用") P
+                continue
+            }
             if (mode == "public" && !PUB[k]) continue
             shown++
             s = svc[port "/" proto]; if (s == "") s = common[port]; if (s == "") s = "-"
@@ -260,10 +287,10 @@ show_ports() {
             } else {
                 scope = cell("本机", 7, ""); st = cell("-", 9, "")
             }
-            printf "%s%s%s%s%s%s%s\n", cell(proto, 6, C), cell(port, 8, ""), scope, st,
+            printf "%s%s%s%s%s%s%s\n", cell(proto, 6, C), cell(port, pw, ""), scope, st,
                 cell(s, 16, ""), cell(A[k], 26, ""), (PR[k] == "" ? "-" : PR[k])
         }
-        if (shown == 0) {
+        if (shown + nun == 0) {
             if (mode == "all" || mode == "public") { print "  (没有找到监听中的端口)"; exit }
             print "  端口 " mode " 当前没有程序在监听，所以外部无论如何都连不上"
             # 没有程序监听时，单独说明防火墙对这个端口的态度
@@ -282,6 +309,7 @@ show_ports() {
         }
         printf "\n共 %d 个监听项，其中 %d 个对公网监听", shown, npub
         if (nblock > 0) printf "，%s%d 个未被防火墙放行%s", R, nblock, P
+        if (nun > 0) printf "，%s%d 项已放行但未使用%s", Y, nun, P
         print ""
     }'
 
@@ -293,7 +321,8 @@ show_ports() {
         printf '  %s(入站默认拒绝：只有已放行的端口能访问)%s' "$GREEN" "$PLAIN"
     fi
     echo
-    printf '说明: 已放行=有明确放行规则  默认放行=没有规则但防火墙未拦截  未放行=外部无法访问\n'
+    printf '说明: 已放行=有明确放行规则  默认放行=没有规则但防火墙未拦截  未放行=外部无法访问  未使用=已放行但没有程序监听\n'
+    printf '      既没有放行规则、也没有程序监听的端口不会列出，可用「查询指定端口」查看\n'
     printf '%s提示: 云服务器(阿里云/腾讯云/AWS 等)还需在控制台「安全组」中放行端口，本脚本无法修改安全组。%s\n' "$YELLOW" "$PLAIN"
 }
 
@@ -1946,7 +1975,7 @@ portman v${VERSION} - VPS 端口查看与管理工具
 
 命令列表:
    1. portman                        打开交互菜单，输入数字选择功能
-   2. portman list                   查看所有监听端口（协议、进程、防火墙是否放行）
+   2. portman list                   查看所有端口：正在监听的，以及已放行但未使用的
    3. portman public                 只看对公网开放的端口
    4. portman check <端口>           查询某个端口被哪个程序占用
    5. portman open  <端口> [协议]    放行(开启)端口，协议: tcp(默认) / udp / both
@@ -1998,7 +2027,7 @@ menu() {
             printf '      快捷键: 任意位置输入 %ss%s 回车即可打开本菜单\n' "$CYAN" "$PLAIN"
         fi
         echo
-        echo "  1. 查看所有监听端口"
+        echo "  1. 查看所有端口 (正在监听 + 已放行未使用)"
         echo "  2. 只看对公网开放的端口"
         echo "  3. 查询指定端口"
         echo "  4. 放行(开启)端口"

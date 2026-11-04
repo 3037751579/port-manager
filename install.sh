@@ -53,7 +53,7 @@ cat <<'EOF'
 常用命令:
   0. s                     快捷键：输入 s 回车，直接打开菜单
   1. portman               打开交互菜单，输入数字选择功能
-  2. portman list          查看所有监听端口（协议、进程、防火墙是否放行）
+  2. portman list          查看所有端口：正在监听的，以及已放行但未使用的
   3. portman public        只看对公网开放的端口
   4. portman check 80      查询某个端口被谁占用
   5. portman open 8080     放行(开启) 8080 端口，默认 tcp
