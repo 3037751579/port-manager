@@ -3,10 +3,10 @@
 # portman - VPS 端口查看与管理工具
 #   查看监听端口、协议类型、占用进程、防火墙放行状态，并可放行/关闭指定端口。
 #
-# 仓库: https://github.com/3037751579/port-manager
+# 仓库: https://github.com/Eggfin/port-manager
 
 VERSION="1.6.2"
-REPO="3037751579/port-manager"
+REPO="Eggfin/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
 BIN_DIR="/usr/local/bin"

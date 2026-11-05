@@ -7,19 +7,19 @@ VPS 端口查看与管理工具：一条命令看清服务器开放了哪些端�
 以 root 登录 SSH 后执行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Eggfin/port-manager/main/install.sh)
 ```
 
 没有 curl 时用 wget：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/3037751579/port-manager/main/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/Eggfin/port-manager/main/install.sh)
 ```
 
 非 root 用户：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Eggfin/port-manager/main/install.sh | sudo bash
 ```
 
 安装后命令为 `portman`，位于 `/usr/local/bin/portman`。
@@ -118,7 +118,7 @@ udp   51820   公网   未放行   -               0.0.0.0                   -
 新服务器一条命令完成（把 `abc123` 换成你的 sshid.io 用户名）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/install.sh) && portman ssh addkey abc123 && portman ssh keyonly -y
+bash <(curl -fsSL https://raw.githubusercontent.com/Eggfin/port-manager/main/install.sh) && portman ssh addkey abc123 && portman ssh keyonly -y
 ```
 
 ## 注意

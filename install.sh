@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # portman 一键安装脚本
-#   bash <(curl -fsSL https://raw.githubusercontent.com/3037751579/port-manager/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Eggfin/port-manager/main/install.sh)
 
 set -e
 
-REPO="3037751579/port-manager"
+REPO="Eggfin/port-manager"
 URL="https://raw.githubusercontent.com/${REPO}/main/portman.sh"
 INSTALL_PATH="/usr/local/bin/portman"
 
