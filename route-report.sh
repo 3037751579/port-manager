@@ -126,6 +126,7 @@ route_install_deps() {
 route_label() {
     local asn=${1#AS} ip=${2:-} owner=${3:-}
     [[ $asn == '-' ]] && asn=''
+    [[ $owner == '-' ]] && owner=''
     if [[ $ip == 59.43.* ]]; then echo '电信 CN2 骨干'; return; fi
     case $asn in
         4809) echo '电信 CN2 骨干';;
