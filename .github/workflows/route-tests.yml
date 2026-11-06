@@ -19,6 +19,8 @@ jobs:
           command -v shellcheck || true
       - name: Run offline NextTrace mock tests
         run: bash tests/test-route.sh
+      - name: Missing-dependency installation regression tests
+        run: sudo bash tests/test-deps.sh
       - name: Offline installer and updater integration test
         run: sudo bash tests/test-install.sh
       - name: NextTrace v1.7.5 real JSON smoke test (loopback)
