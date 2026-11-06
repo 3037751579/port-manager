@@ -81,44 +81,144 @@ route_set_target() {
     route_note "已保存：$(route_city_cn "$city")$(route_isp_cn "$isp") → $target"
 }
 
+route_find_nexttrace() {
+    local p
+    p=$(command -v nexttrace 2>/dev/null) || p=""
+    if [[ -n $p ]]; then printf '%s\n' "$p"; return 0; fi
+    for p in /usr/local/bin/nexttrace /usr/bin/nexttrace "${HOME:-/root}/.local/bin/nexttrace"; do
+        if [[ -x $p ]]; then printf '%s\n' "$p"; return 0; fi
+    done
+    return 1
+}
+
+route_doctor() {
+    local nt jq_path
+    printf '\n===== 路由检测 · 依赖诊断 =====\n'
+    printf '系统: %s / %s\n' "$(uname -s)" "$(uname -m)"
+    printf 'PATH: %s\n' "$PATH"
+    nt=$(route_find_nexttrace) || nt=""
+    if [[ -n $nt ]]; then
+        printf '[正常] NextTrace: %s\n' "$nt"
+        "$nt" --version 2>&1 | head -n 2
+    else
+        printf '[缺失] NextTrace: 未找到可执行文件\n'
+    fi
+    jq_path=$(command -v jq 2>/dev/null) || jq_path=""
+    if [[ -n $jq_path ]]; then
+        printf '[正常] jq: %s\n' "$jq_path"
+        jq --version 2>&1 | head -n 1
+    else
+        printf '[缺失] jq: 未找到可执行文件\n'
+    fi
+    if [[ -n $nt && -n $jq_path ]]; then
+        route_note '依赖检查通过，可以开始检测。'
+        return 0
+    fi
+    route_note '检测依赖未就绪，可运行 portman route install 或选择子菜单 10。'
+    return 1
+}
+
 route_require() {
     local missing=0
-    if ! command -v nexttrace >/dev/null 2>&1; then
-        route_err '未安装 NextTrace，进入菜单选择「安装检测依赖」，或运行 curl -fsSL https://nxtrace.org/nt | bash'
+    ROUTE_NT_BIN=$(route_find_nexttrace) || ROUTE_NT_BIN=""
+    if [[ -z $ROUTE_NT_BIN ]]; then
+        route_err 'NextTrace 未找到（不是线路故障）；运行 portman route install 修复。'
         missing=1
     fi
     if ! command -v jq >/dev/null 2>&1; then
-        route_err '未安装 jq，Debian/Ubuntu 可执行 apt-get update && apt-get install -y jq'
+        route_err 'jq 未找到；运行 portman route install 修复。'
         missing=1
     fi
     return "$missing"
 }
-route_install_deps() {
-    local a
-    route_note '将检查 jq 和 NextTrace。第三方安装脚本需要从网络下载并执行。'
-    read -rp '确定安装缺失依赖？[y/N] ' a
-    [[ $a == y || $a == Y ]] || return 0
-    if ! command -v jq >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update && apt-get install -y jq || return 1
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y jq || return 1
-        elif command -v apk >/dev/null 2>&1; then
-            apk add jq || return 1
-        else
-            route_err '无法自动安装 jq，请通过系统包管理器手动安装'; return 1
-        fi
-    fi
-    if ! command -v nexttrace >/dev/null 2>&1; then
+
+route_fetch_installer() {
+    local dest=$1 url
+    # 优先官方入口，失败时使用官方源码仓库中的安装脚本。
+    for url in https://nxtrace.org/nt https://raw.githubusercontent.com/nxtrace/NTrace-core/main/nt_install.sh; do
+        rm -f "$dest"
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSL https://nxtrace.org/nt | bash || return 1
+            if curl -fLsS --connect-timeout 10 --max-time 60 --retry 2 -o "$dest" "$url" && [[ -s $dest ]] && sh -n "$dest"; then
+                route_note "安装脚本下载成功：$url"
+                return 0
+            fi
         elif command -v wget >/dev/null 2>&1; then
-            wget -qO- https://nxtrace.org/nt | bash || return 1
+            if wget -q --timeout=60 -O "$dest" "$url" && [[ -s $dest ]] && sh -n "$dest"; then
+                route_note "安装脚本下载成功：$url"
+                return 0
+            fi
         else
-            route_err '需要 curl 或 wget 安装 NextTrace'; return 1
+            route_err '缺少 curl 和 wget，无法下载安装脚本'
+            return 1
         fi
+    done
+    route_err 'NextTrace 官方安装脚本下载或语法校验失败，检查 DNS/HTTPS/网络后重试。'
+    return 1
+}
+
+route_install_deps() {
+    local answer installer rc=0
+    local nt jq_path
+    nt=$(route_find_nexttrace) || nt=""
+    jq_path=$(command -v jq 2>/dev/null) || jq_path=""
+    route_note "当前状态：NextTrace=$([[ -n $nt ]] && echo 已找到 || echo 缺失)；jq=$([[ -n $jq_path ]] && echo 已找到 || echo 缺失)"
+    if [[ -n $nt && -n $jq_path ]]; then
+        route_note '依赖已齐全，无需重复安装。'
+        return 0
     fi
-    route_require && route_note '依赖已就绪'
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        route_err '安装依赖需要 root 权限，请使用 root 登录或 sudo portman route install。'
+        return 1
+    fi
+    route_note '安装将使用系统包管理器（jq）及 NextTrace 官方安装脚本（--system）。'
+    read -rp '确认安装缺失依赖？请输入 y 继续 [y/N]: ' answer || answer=""
+    case $answer in
+        y|Y|yes|YES) ;;
+        *) route_note '未执行安装（已取消）。'; return 1 ;;
+    esac
+
+    if [[ -z $jq_path ]]; then
+        route_note '正在安装 jq...'
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update && apt-get install -y jq || rc=$?
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y jq || rc=$?
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y jq || rc=$?
+        elif command -v apk >/dev/null 2>&1; then
+            apk add jq || rc=$?
+        else
+            route_err '系统包管理器不受支持，请手动安装 jq。'
+            return 1
+        fi
+        if ((rc != 0)) || ! command -v jq >/dev/null 2>&1; then
+            route_err "jq 安装失败（退出码 $rc），请检查上面的包管理器错误信息。"
+            return 1
+        fi
+        route_note "jq 安装完成：$(command -v jq)"
+    fi
+
+    if [[ -z $nt ]]; then
+        installer=$(mktemp) || { route_err '无法创建临时文件'; return 1; }
+        route_note '正在下载 NextTrace 官方安装器...'
+        if ! route_fetch_installer "$installer"; then rm -f "$installer"; return 1; fi
+        route_note '正在安装 NextTrace 到 /usr/local/bin（系统模式）...'
+        # 从文件执行，保留真实退出码，避免「下载失败 | bash 返回成功」。
+        if ! sh "$installer" --system; then
+            rm -f "$installer"
+            route_err 'NextTrace 安装器执行失败，请查看上面的下载/安装错误。'
+            return 1
+        fi
+        rm -f "$installer"
+    fi
+
+    # 强制复检安装位置及可执行性，防止“提示成功但找不到命令”。
+    if ! route_require; then
+        route_err '安装过程结束，但依赖仍未齐全。执行 portman route doctor 查看路径。'
+        return 1
+    fi
+    route_note '全部依赖安装并验证成功！'
+    route_doctor
 }
 
 # 仅根据实际可见的 ASN/IP 判断，不把经过某条优质骨干等同于全程优质，
@@ -241,15 +341,17 @@ route_render() {
 
 route_probe_one() {
     local city=$1 isp=$2 ip=$3 detail=$4 mtr=$5 outputdir=$6 summary_file=${7:--}
-    local raw err count=3 code=0
+    local raw err count=3 code=0 nexttrace_bin
+    nexttrace_bin=${ROUTE_NT_BIN:-}
+    if [[ -z $nexttrace_bin ]]; then nexttrace_bin=$(route_find_nexttrace) || { route_err "找不到 NextTrace"; return 1; }; fi
     [[ $mtr == 1 ]] && count=20
     raw=$(mktemp) || return 1
     err=$(mktemp) || { rm -f "$raw"; return 1; }
     printf '\n[测试] %s%s → %s (每跳 %s 次)\n' "$(route_city_cn "$city")" "$(route_isp_cn "$isp")" "$ip" "$count"
     if command -v timeout >/dev/null 2>&1; then
-        timeout 180 nexttrace -r --json --language cn --no-rdns -q "$count" "$ip" > "$raw" 2>"$err" || code=$?
+        timeout 180 "$nexttrace_bin" -r --json --language cn --no-rdns -q "$count" "$ip" > "$raw" 2>"$err" || code=$?
     else
-        nexttrace -r --json --language cn --no-rdns -q "$count" "$ip" > "$raw" 2>"$err" || code=$?
+        "$nexttrace_bin" -r --json --language cn --no-rdns -q "$count" "$ip" > "$raw" 2>"$err" || code=$?
     fi
     if ! route_json_valid "$raw"; then
         if [[ $summary_file != '-' ]]; then
@@ -338,6 +440,7 @@ route_usage() {
   portman route set suzhou ct 目标IP     设置苏州测试地址（cu=联通，cm=移动）
   portman route menu                    交互菜单
   portman route install                 确认后安装缺失依赖
+  portman route doctor                  显示依赖状态、实际路径及版本
 参数: --detail 详细逐跳 | --save 保存报告 | --mtr 稳定性测试
 提示: 苏州首次使用需指定三网测试 IP，防止误用外地节点。
 HELP
@@ -350,8 +453,8 @@ route_menu() {
         printf ' 3. 北京三网测试\n 4. 广州三网测试\n 5. 苏州三网测试\n'
         printf ' 6. 上海三网 MTR 稳定性（20 次/跳）\n'
         printf ' 7. 自定义目标 IP / 域名\n 8. 配置苏州测试地址\n'
-        printf ' 9. 上海三网测试并保存报告\n 10. 安装检测依赖\n 0. 返回上级\n'
-        read -rp '请选择 [0-10]: ' choice || return 0
+        printf ' 9. 上海三网测试并保存报告\n 10. 安装/修复检测依赖\n 11. 检查依赖状态\n 0. 返回上级\n'
+        read -rp '请选择 [0-11]: ' choice || return 0
         case $choice in
             1) route_run shanghai all 0 0 0;;
             2) route_run shanghai all 1 0 0;;
@@ -366,6 +469,7 @@ route_menu() {
                 route_set_target suzhou "$isp" "$ip";;
             9) route_run shanghai all 0 0 1;;
             10) route_install_deps;;
+            11) route_doctor;;
             0|q) return 0;;
             *) route_err '无效选择';;
         esac
@@ -379,6 +483,7 @@ route_main() {
         menu) shift; route_menu; return ;;
         help|-h|--help) route_usage; return ;;
         install) route_install_deps; return ;;
+        doctor) route_doctor; return ;;
         set) shift; route_set_target "${1:-}" "${2:-}" "${3:-}"; return ;;
         mtr) mtr=1; shift ;;
     esac
