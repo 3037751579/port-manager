@@ -19,6 +19,16 @@ jobs:
           command -v shellcheck || true
       - name: Run offline NextTrace mock tests
         run: bash tests/test-route.sh
+      - name: Offline installer and updater integration test
+        run: sudo bash tests/test-install.sh
+      - name: NextTrace v1.7.5 real JSON smoke test (loopback)
+        run: |
+          curl -fLsS --retry 2 --max-time 60 -o "$RUNNER_TEMP/nexttrace" \
+            https://github.com/nxtrace/NTrace-core/releases/download/v1.7.5/nexttrace_linux_amd64
+          chmod +x "$RUNNER_TEMP/nexttrace"
+          sudo "$RUNNER_TEMP/nexttrace" -r --json --language cn \
+            --data-provider disable-geoip --no-rdns -q 2 127.0.0.1 > "$RUNNER_TEMP/loopback.json"
+          jq -e '.schema_version == 1 and (.stats | type == "array") and .path_end.reason == "destination_reached"' "$RUNNER_TEMP/loopback.json"
       - name: ShellCheck new module
         run: |
           if command -v shellcheck >/dev/null 2>&1; then
