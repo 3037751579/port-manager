@@ -2,32 +2,56 @@
 #
 # portman 一键安装脚本
 #   bash <(curl -fsSL https://raw.githubusercontent.com/Eggfin/port-manager/main/install.sh)
+#
+# 安装内容:
+#   /usr/local/bin/portman                   主程序
+#   /usr/local/lib/portman/route-report.sh   三网路由检测模块
 
 set -e
 
 REPO="Eggfin/port-manager"
-URL="https://raw.githubusercontent.com/${REPO}/main/portman.sh"
+RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
 ROUTE_MODULE="/usr/local/lib/portman/route-report.sh"
-ROUTE_URL="https://raw.githubusercontent.com/${REPO}/main/route-report.sh"
 
-RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; PLAIN=$'\033[0m'
+if [[ -t 1 ]]; then
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; PLAIN=$'\033[0m'
+else
+    RED=""; GREEN=""; YELLOW=""; PLAIN=""
+fi
+
+info()  { echo "${GREEN}[信息]${PLAIN} $*"; }
+warn()  { echo "${YELLOW}[信息]${PLAIN} $*"; }
+error() { echo "${RED}[错误]${PLAIN} $*" >&2; }
+has()   { command -v "$1" >/dev/null 2>&1; }
+
+# 下载 $RAW_URL/$1 到 $2
+download() {
+    if has curl; then
+        curl -fsSL "$RAW_URL/$1" -o "$2"
+    elif has wget; then
+        wget -qO "$2" "$RAW_URL/$1"
+    else
+        error "需要 curl 或 wget"
+        exit 1
+    fi
+}
 
 if [[ $EUID -ne 0 ]]; then
-    echo "${RED}[错误]${PLAIN} 请使用 root 运行安装脚本 (或在命令前加 sudo)"
+    error "请使用 root 运行安装脚本 (或在命令前加 sudo)"
     exit 1
 fi
 
-# 缺少 ss/netstat 时尝试安装 iproute2
-if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
-    echo "${YELLOW}[信息]${PLAIN} 正在安装 iproute2..."
-    if command -v apt-get >/dev/null 2>&1; then
+# 缺少 ss / netstat 时尝试安装 iproute2
+if ! has ss && ! has netstat; then
+    warn "正在安装 iproute2..."
+    if has apt-get; then
         apt-get update -qq && apt-get install -y -qq iproute2
-    elif command -v dnf >/dev/null 2>&1; then
+    elif has dnf; then
         dnf install -y -q iproute
-    elif command -v yum >/dev/null 2>&1; then
+    elif has yum; then
         yum install -y -q iproute
-    elif command -v apk >/dev/null 2>&1; then
+    elif has apk; then
         apk add --quiet iproute2
     fi
 fi
@@ -36,25 +60,18 @@ tmp=$(mktemp)
 route_tmp=$(mktemp)
 trap 'rm -f "$tmp" "$route_tmp"' EXIT
 
-echo "${GREEN}[信息]${PLAIN} 正在下载 portman..."
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "$tmp"
-    curl -fsSL "$ROUTE_URL" -o "$route_tmp"
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp" "$URL"
-    wget -qO "$route_tmp" "$ROUTE_URL"
-else
-    echo "${RED}[错误]${PLAIN} 需要 curl 或 wget"
-    exit 1
-fi
-
+# 两个文件都下载并通过语法检查后才安装
+info "正在下载 portman..."
+download portman.sh "$tmp"
+download route-report.sh "$route_tmp"
 bash -n "$tmp"
 bash -n "$route_tmp"
+
 install -d -m 755 "${ROUTE_MODULE%/*}"
 install -m 755 "$route_tmp" "$ROUTE_MODULE"
 install -m 755 "$tmp" "$INSTALL_PATH"
 
-echo "${GREEN}[信息]${PLAIN} 安装完成: $("$INSTALL_PATH" version)"
+info "安装完成: $("$INSTALL_PATH" version)"
 "$INSTALL_PATH" shortcut
 echo
 cat <<'EOF'

@@ -1,17 +1,50 @@
 #!/usr/bin/env bash
 #
 # portman - VPS 端口查看与管理工具
-#   查看监听端口、协议类型、占用进程、防火墙放行状态，并可放行/关闭指定端口。
+#   查看监听端口、协议类型、占用进程、防火墙放行状态，并可放行/关闭指定端口；
+#   附带 IPv6 开关、SSH 密钥登录管理和三网路由检测 (route-report.sh 模块)。
 #
 # 仓库: https://github.com/Eggfin/port-manager
+#
+# 目录:
+#   1. 配置与通用函数
+#   2. 端口采集、防火墙识别与端口表
+#   3. 防火墙操作: iptables 持久化、放行 / 关闭、一键关闭其他端口
+#   4. IPv4 / IPv6
+#   5. SSH: 密钥登录、登录记录、公钥管理、安全加固
+#   6. 安装维护: 快捷键、更新、卸载、路由模块
+#   7. 菜单与命令行
 
-VERSION="1.7.2"
+# ===========================================================================
+# 1. 配置与通用函数
+# ===========================================================================
+VERSION="1.7.3"
 REPO="Eggfin/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
+
+# 安装位置
 INSTALL_PATH="/usr/local/bin/portman"
 BIN_DIR="/usr/local/bin"
 ROUTE_MODULE="/usr/local/lib/portman/route-report.sh"
 SHORTCUTS="s S"
+
+# iptables 规则持久化: portman 添加的规则记录在 STATE_FILE，开机由 systemd 服务恢复
+STATE_FILE="/etc/portman/iptables.conf"
+SERVICE_NAME="portman-restore.service"
+SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
+
+# IPv6 开关: 文件名以 99-zz 开头，排在 99-sysctl.conf 之后，不会被系统默认配置覆盖
+SYSCTL_FILE="/etc/sysctl.d/99-zz-portman-ipv6.conf"
+
+# SSH 配置
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_DIR="/etc/ssh/sshd_config.d"
+KEY_ONLY_FILE="$SSHD_DIR/00-key-only.conf"
+PASSWORD_FILE="$SSHD_DIR/00-password-login.conf"
+SSHD_MARK_BEGIN="# >>> portman ssh >>>"
+SSHD_MARK_END="# <<< portman ssh <<<"
+SSH_CONF="/etc/portman/ssh.conf"
+KEY_RE='^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+=*( |$)'
 
 if [[ -t 1 ]]; then
     RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
@@ -34,9 +67,51 @@ need_root() {
 
 has() { command -v "$1" >/dev/null 2>&1; }
 
-# ---------------------------------------------------------------------------
+# 询问 [y/N]，只有回答 y 时返回 0
+confirm() {
+    local ans
+    read -rp "$1 [y/N]: " ans
+    [[ $ans == [yY] ]]
+}
+
+# 高风险操作: 必须输入 yes 才继续
+confirm_yes() {
+    local ans
+    read -rp "$1请输入 yes: " ans
+    [[ $ans == yes ]]
+}
+
+cancelled() { info "已取消"; }
+
+pause() { read -rp "按回车键返回菜单..." _; }
+
+# 分节标题，例如: ========== IPv4 ==========
+title() { printf '%s========== %s ==========%s\n' "$BOLD" "$*" "$PLAIN"; }
+
+# 菜单标题和分组
+menu_title() { printf '%s===== %s =====%s\n' "$BOLD" "$*" "$PLAIN"; }
+menu_group() { printf '  %s%s%s\n' "$CYAN" "$*" "$PLAIN"; }
+
+download() {
+    if has curl; then curl -fsSL "$1" -o "$2"
+    elif has wget; then wget -qO "$2" "$1"
+    else error "需要 curl 或 wget"; return 1
+    fi
+}
+
+nft_unsupported() {
+    error "检测到原生 nftables 规则，暂不支持自动修改，请手动配置或改用 ufw/firewalld"
+}
+
+# 监听地址是否只限本机 (awk 片段，show_ports 与 keep_list 共用)
+AWK_IS_LOCAL='function is_local(a) {
+    return a ~ /^127\./ || a == "[::1]" || a == "::1" || a ~ /^\[::ffff:127\./ || a ~ /%lo$/
+}'
+
+# ===========================================================================
+# 2. 端口采集、防火墙识别与端口表
+# ===========================================================================
 # 采集监听端口，统一输出为: 协议|地址|端口|进程(PID),进程(PID)
-# ---------------------------------------------------------------------------
 collect_listen() {
     if has ss; then
         ss -tulnp 2>/dev/null | awk '
@@ -75,8 +150,9 @@ collect_listen() {
 }
 
 # ---------------------------------------------------------------------------
-# 防火墙
+# 防火墙识别
 # ---------------------------------------------------------------------------
+# 输出: ufw | firewalld | iptables | nftables | none
 detect_firewall() {
     if has ufw && LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
         echo ufw
@@ -194,9 +270,7 @@ show_ports() {
         pad = w - dw(s); if (pad < 1) pad = 1
         return color s (color == "" ? "" : P) sprintf("%" pad "s", "")
     }
-    function is_local(a) {
-        return a ~ /^127\./ || a == "[::1]" || a == "::1" || a ~ /^\[::ffff:127\./ || a ~ /%lo$/
-    }
+    '"$AWK_IS_LOCAL"'
     function fw_allows(proto, port,   i) {
         if (allow_all) return 1
         for (i = 1; i <= nal; i++)
@@ -362,14 +436,15 @@ parse_proto() {
     esac
 }
 
+# ===========================================================================
+# 3. 防火墙操作
+# ===========================================================================
 # ---------------------------------------------------------------------------
 # iptables 规则持久化
-#   portman 把自己添加的规则记录在 STATE_FILE，开机时由 systemd 服务调用
-#   `portman restore` 重新应用。只恢复 portman 的规则，不影响 docker/fail2ban 等。
+#   portman 把自己添加的规则记录在 STATE_FILE (每行 "allow 协议 端口" 或
+#   "policy DROP|ACCEPT")，开机时由 systemd 服务调用 `portman restore` 重新应用。
+#   只恢复 portman 的规则，不影响 docker / fail2ban 等。
 # ---------------------------------------------------------------------------
-STATE_FILE="/etc/portman/iptables.conf"
-SERVICE_NAME="portman-restore.service"
-SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
 
 # 规则不存在时插入到 INPUT 最前面
 ipt_add() {
@@ -465,7 +540,7 @@ remove_restore_service() {
 # ---------------------------------------------------------------------------
 open_port() {
     need_root || return 1
-    local ports protos fw port p ipt_port cmd changed=0
+    local ports protos fw port p cmd changed=0
     ports=$(parse_ports "$1") || return 1
     protos=$(parse_proto "${2:-tcp}") || return 1
     fw=$(detect_firewall)
@@ -476,7 +551,7 @@ open_port() {
             warn "如果是云服务器，请到控制台「安全组」中放行对应端口"
             return 0 ;;
         nftables)
-            error "检测到原生 nftables 规则，暂不支持自动修改，请手动添加规则或改用 ufw/firewalld"
+            nft_unsupported
             return 1 ;;
     esac
 
@@ -520,20 +595,19 @@ hits_ssh_port() {
 
 close_port() {
     need_root || return 1
-    local ports protos fw port p ipt_port cmd sshp ans
+    local ports protos fw port p ipt_port cmd sshp
     ports=$(parse_ports "$1") || return 1
     protos=$(parse_proto "${2:-tcp}") || return 1
     fw=$(detect_firewall)
 
     case $fw in
         none)     warn "未检测到防火墙，没有可删除的放行规则"; return 0 ;;
-        nftables) error "检测到原生 nftables 规则，暂不支持自动修改"; return 1 ;;
+        nftables) nft_unsupported; return 1 ;;
     esac
 
     if sshp=$(hits_ssh_port "$ports"); then
         warn "端口 $sshp 是当前 SSH 端口，关闭后可能导致无法远程登录！"
-        read -rp "确定要继续吗? [y/N]: " ans
-        [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+        confirm "确定要继续吗?" || { cancelled; return 0; }
     fi
 
     info "使用 $(firewall_name "$fw") 关闭端口..."
@@ -593,10 +667,7 @@ lock_backend() {
 keep_list() {
     local p
     {
-        collect_listen | awk -F'|' '
-            !($2 ~ /^127\./ || $2 == "[::1]" || $2 == "::1" || $2 ~ /^\[::ffff:127\./ || $2 ~ /%lo$/) {
-                print $1, $3, $4
-            }'
+        collect_listen | awk -F'|' "$AWK_IS_LOCAL"' !is_local($2) { print $1, $3, $4 }'
         p=$(ssh_ports)
         for p in ${p:-22}; do echo "tcp $p SSH"; done
     } | awk '!seen[$1 " " $2]++' | sort -k2,2n -k1,1
@@ -604,21 +675,20 @@ keep_list() {
 
 lockdown() {
     need_root || return 1
-    local backend keep extra eprotos port p ans cmd state_ok
+    local backend keep extra eprotos port p ans cmd state_ok zone
 
     backend=$(lock_backend)
     if [[ $backend == none ]]; then
         warn "未检测到可用的防火墙"
         if has apt-get; then
-            read -rp "是否安装 ufw 防火墙? [y/N]: " ans
-            [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+            confirm "是否安装 ufw 防火墙?" || { cancelled; return 0; }
             apt-get update -qq && apt-get install -y -qq ufw || { error "ufw 安装失败"; return 1; }
             backend=ufw-off
         else
             error "请先安装 firewalld 或 iptables"; return 1
         fi
     elif [[ $backend == nftables ]]; then
-        error "检测到原生 nftables 规则，暂不支持自动修改，请手动配置或改用 ufw/firewalld"
+        nft_unsupported
         return 1
     fi
 
@@ -643,8 +713,7 @@ lockdown() {
     echo
     warn "将使用 $(firewall_name "${backend%-off}") 设置为「默认拒绝入站」，只放行上面列出的端口"
     warn "SSH 端口会自动保留；已有的放行规则不会被删除"
-    read -rp "确认执行请输入 yes: " ans
-    [[ $ans == yes ]] || { info "已取消"; return 0; }
+    confirm_yes "确认执行" || { cancelled; return 0; }
 
     case $backend in
         ufw|ufw-off)
@@ -656,7 +725,6 @@ lockdown() {
             [[ $backend == ufw-off ]] && ufw --force enable >/dev/null
             ;;
         firewalld)
-            local zone
             zone=$(firewall-cmd --get-default-zone)
             while read -r p port _; do
                 firewall-cmd --permanent --zone="$zone" --add-port="$port/$p" >/dev/null
@@ -694,13 +762,14 @@ lockdown() {
 
 unlock() {
     need_root || return 1
-    local fw ans cmd
+    local fw cmd
     fw=$(detect_firewall)
-    if [[ $fw == none ]]; then info "未检测到防火墙，所有端口本来就是放行的"; return 0; fi
-    if [[ $fw == nftables ]]; then error "检测到原生 nftables 规则，暂不支持自动修改"; return 1; fi
+    case $fw in
+        none)     info "未检测到防火墙，所有端口本来就是放行的"; return 0 ;;
+        nftables) nft_unsupported; return 1 ;;
+    esac
 
-    read -rp "将把 $(firewall_name "$fw") 改为「默认放行所有入站端口」，确认? [y/N]: " ans
-    [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+    confirm "将把 $(firewall_name "$fw") 改为「默认放行所有入站端口」，确认?" || { cancelled; return 0; }
 
     case $fw in
         ufw) ufw default allow incoming >/dev/null ;;
@@ -717,6 +786,9 @@ unlock() {
     info "已恢复：所有入站端口均已放行"
 }
 
+# ---------------------------------------------------------------------------
+# 防火墙状态页
+# ---------------------------------------------------------------------------
 show_firewall() {
     need_root || return 1
     local fw rules icmp
@@ -795,12 +867,10 @@ show_firewall() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# IPv4 / IPv6 状态与 IPv6 开关
-#   禁用写入 sysctl.d 配置文件，开机由 systemd-sysctl 自动加载。
-#   文件名以 99-zz 开头，排在 99-sysctl.conf 之后，不会被系统默认配置覆盖。
-# ---------------------------------------------------------------------------
-SYSCTL_FILE="/etc/sysctl.d/99-zz-portman-ipv6.conf"
+# ===========================================================================
+# 4. IPv4 / IPv6
+#   禁用 IPv6 时写入 SYSCTL_FILE，开机由 systemd-sysctl 自动加载。
+# ===========================================================================
 
 # 输出: kernel-off (内核参数禁用) | off (sysctl 禁用) | on
 ipv6_state() {
@@ -836,7 +906,7 @@ public_ip() {
 }
 
 print_ip_family() {
-    local v=$1 addrs route pub label
+    local v=$1 addrs route pub
     addrs=$(ip -o -"$v" addr show scope global 2>/dev/null | awk '{ printf "%s%s %s", (n++ ? "\n          " : ""), $2, $4 }')
     route=$(ip -"$v" route show default 2>/dev/null | head -1)
     printf '本机地址: %s\n' "${addrs:-${YELLOW}无公网地址${PLAIN}}"
@@ -856,7 +926,7 @@ show_ip_status() {
     info "正在检测网络，最多需要十几秒..."
     echo
 
-    printf '%s========== IPv4 ==========%s\n' "$BOLD" "$PLAIN"
+    title IPv4
     if [[ -n $(ip -o -4 addr show scope global 2>/dev/null) ]]; then
         printf '状态:     %s已启用%s\n' "$GREEN" "$PLAIN"
     else
@@ -865,7 +935,7 @@ show_ip_status() {
     print_ip_family 4
     echo
 
-    printf '%s========== IPv6 ==========%s\n' "$BOLD" "$PLAIN"
+    title IPv6
     state=$(ipv6_state)
     case $state in
         on)  printf '状态:     %s已启用%s\n' "$GREEN" "$PLAIN" ;;
@@ -885,7 +955,7 @@ show_ip_status() {
 
 ipv6_disable() {
     need_root || return 1
-    local state server_ip ans
+    local state server_ip
     state=$(ipv6_state)
     if [[ $state == kernel-off ]]; then info "IPv6 已被内核参数禁用，无需操作"; return 0; fi
 
@@ -900,8 +970,7 @@ ipv6_disable() {
     fi
 
     warn "禁用后，服务器的 IPv6 地址会失效，IPv6 入站和出站都将不可用 (本机回环 ::1 保留)"
-    read -rp "确认禁用 IPv6? [y/N]: " ans
-    [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+    confirm "确认禁用 IPv6?" || { cancelled; return 0; }
 
     cat >"$SYSCTL_FILE" <<'EOF'
 # 由 portman 生成: 禁用 IPv6，保留本机回环 ::1
@@ -945,17 +1014,18 @@ ipv6_enable() {
 }
 
 ipv6_menu() {
-    local c state
-    state=$(ipv6_state)
-    case $state in
-        on)  printf 'IPv6 当前状态: %s已启用%s\n\n' "$GREEN" "$PLAIN" ;;
-        *)   printf 'IPv6 当前状态: %s已禁用%s\n\n' "$RED" "$PLAIN" ;;
-    esac
+    local c
+    if [[ $(ipv6_state) == on ]]; then
+        printf 'IPv6 当前状态: %s已启用%s\n\n' "$GREEN" "$PLAIN"
+    else
+        printf 'IPv6 当前状态: %s已禁用%s\n\n' "$RED" "$PLAIN"
+    fi
     echo "  1. 禁用 IPv6 (重启后保持)"
     echo "  2. 启用 IPv6 (重启后保持)"
     echo "  0. 返回"
     echo
     read -rp "请选择 [0-2]: " c
+    echo
     case $c in
         1) ipv6_disable ;;
         2) ipv6_enable ;;
@@ -963,19 +1033,14 @@ ipv6_menu() {
     esac
 }
 
+# ===========================================================================
+# 5. SSH
+# ===========================================================================
 # ---------------------------------------------------------------------------
 # SSH 密钥登录
 #   有 sshd_config.d 时写入 00-key-only.conf (与常见代码片段同名，可互相识别)；
 #   否则在 sshd_config 顶部插入带标记的配置块。sshd 取第一次出现的值，所以都排在最前。
 # ---------------------------------------------------------------------------
-SSHD_CONFIG="/etc/ssh/sshd_config"
-SSHD_DIR="/etc/ssh/sshd_config.d"
-KEY_ONLY_FILE="$SSHD_DIR/00-key-only.conf"
-PASSWORD_FILE="$SSHD_DIR/00-password-login.conf"
-SSHD_MARK_BEGIN="# >>> portman ssh >>>"
-SSHD_MARK_END="# <<< portman ssh <<<"
-SSH_CONF="/etc/portman/ssh.conf"
-KEY_RE='^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+=*( |$)'
 
 auth_keys_file() { echo "${HOME:-/root}/.ssh/authorized_keys"; }
 
@@ -1032,6 +1097,9 @@ print_keys() {
 sshd_has_include() {
     grep -Eiq '^[[:space:]]*Include[[:space:]].*sshd_config\.d/' "$SSHD_CONFIG" 2>/dev/null
 }
+
+# portman 的配置写法: sshd_config 会 Include sshd_config.d 时用单独文件，否则写到顶部
+sshd_conf_mode() { if sshd_has_include; then echo file; else echo block; fi; }
 
 ssh_service_state() {
     local svc
@@ -1116,7 +1184,7 @@ ordered_setting_sources() {
     ' "$SSHD_CONFIG" 2>/dev/null | while IFS= read -r item; do
         if [[ $item == @INCLUDE ]]; then
             for f in "$SSHD_DIR"/*.conf; do
-                [[ -f $f ]] && grep -HnEi "^[[:space:]]*$key[[:space:]]" "$f"
+                [[ -f $f ]] && grep -HnEi "^[[:space:]]*${key}[[:space:]]" "$f"
             done
         else
             echo "$item"
@@ -1200,7 +1268,7 @@ ssh_key_only() {
         warn "还没有写入任何公钥，直接关闭密码登录会导致无法登录"
         [[ $auto == -y ]] && { error "请先运行: portman ssh addkey <用户名或链接>"; return 1; }
         read -rp "现在写入公钥吗? [Y/n]: " ans
-        [[ $ans == [nN] ]] && { info "已取消"; return 0; }
+        [[ $ans == [nN] ]] && { cancelled; return 0; }
         ssh_add_key || return 1
         n=$(key_count)
         (( n > 0 )) || return 1
@@ -1220,8 +1288,7 @@ ssh_key_only() {
         echo
         warn "开启后只能用以上公钥对应的密钥登录，密码将无法登录"
         warn "当前 SSH 连接不会断开。开启后请保持此窗口，新开一个 Termius 窗口测试能否登录"
-        read -rp "确认开启只允许密钥登录? [y/N]: " ans
-        [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+        confirm "确认开启只允许密钥登录?" || { cancelled; return 0; }
     fi
 
     content="PubkeyAuthentication yes
@@ -1229,7 +1296,7 @@ PasswordAuthentication no
 $kbdkey no
 PermitRootLogin prohibit-password"
 
-    if sshd_has_include; then mode=file; else mode=block; fi
+    mode=$(sshd_conf_mode)
     apply_sshd_conf "$mode" "$KEY_ONLY_FILE" "$content" || return 1
 
     pw=$(eff_get "$(sshd_effective)" passwordauthentication)
@@ -1256,19 +1323,18 @@ PermitRootLogin prohibit-password"
 
 ssh_password_login() {
     need_root || return 1
-    local st ans eff mode
+    local st eff mode
     st=$(passwd -S root 2>/dev/null | awk '{ print $2 }')
     if [[ $st == L || $st == LK || $st == NP ]]; then
         warn "root 账号当前没有可用的密码，开启后仍无法用密码登录。可先运行 passwd 设置密码"
     fi
-    read -rp "确认恢复密码登录? [y/N]: " ans
-    [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+    confirm "确认恢复密码登录?" || { cancelled; return 0; }
 
     apply_sshd_conf file "" "" || return 1
     eff=$(sshd_effective)
     if [[ $(eff_get "$eff" passwordauthentication) != yes || $(eff_get "$eff" permitrootlogin) != yes ]]; then
         # 系统其他配置仍禁止密码登录，写入一条明确开启的配置
-        if sshd_has_include; then mode=file; else mode=block; fi
+        mode=$(sshd_conf_mode)
         apply_sshd_conf "$mode" "$PASSWORD_FILE" "PasswordAuthentication yes
 PermitRootLogin yes" || return 1
         eff=$(sshd_effective)
@@ -1293,11 +1359,11 @@ yesno() {
 
 ssh_status() {
     need_root || return 1
-    local f n eff pw kbd pub root ports dmode fmode err svc risks ans
+    local f n eff pw kbd pub root ports dmode fmode err svc risks color b
 
     f=$(auth_keys_file)
     n=$(key_count)
-    printf '%s========== 公钥 ==========%s\n' "$BOLD" "$PLAIN"
+    title 公钥
     printf '公钥文件: %s\n' "$f"
     if (( n > 0 )); then
         printf '写入情况: %s✔ 已写入 %d 个公钥%s\n' "$GREEN" "$n" "$PLAIN"
@@ -1319,11 +1385,15 @@ ssh_status() {
     fi
 
     echo
-    printf '%s========== 登录方式 (当前生效的配置) ==========%s\n' "$BOLD" "$PLAIN"
+    title "登录方式 (当前生效的配置)"
     eff=$(sshd_effective)
     if [[ -z $eff ]]; then
-        error "无法读取 sshd 配置:"
-        "$(sshd_bin)" -t 2>&1 | sed 's/^/  /'
+        if b=$(sshd_bin); then
+            error "无法读取 sshd 配置:"
+            "$b" -t 2>&1 | sed 's/^/  /'
+        else
+            error "未找到 sshd，请确认已安装 openssh-server"
+        fi
         return 1
     fi
     pw=$(eff_get "$eff" passwordauthentication)
@@ -1345,7 +1415,7 @@ ssh_status() {
     esac
 
     echo
-    printf '%s========== 配置与服务 ==========%s\n' "$BOLD" "$PLAIN"
+    title 配置与服务
     if [[ -f $KEY_ONLY_FILE ]]; then
         printf '只允许密钥: 已配置 (%s)\n' "$KEY_ONLY_FILE"
     elif grep -qxF "$SSHD_MARK_BEGIN" "$SSHD_CONFIG" 2>/dev/null; then
@@ -1366,14 +1436,11 @@ ssh_status() {
     else
         printf '配置检查: %s✘ 有错误%s %s\n' "$RED" "$PLAIN" "$err"
     fi
-    if svc=$(ssh_service_state); then
-        printf 'SSH 服务: %s%s%s\n' "$GREEN" "$svc" "$PLAIN"
-    else
-        printf 'SSH 服务: %s%s%s\n' "$RED" "$svc" "$PLAIN"
-    fi
+    if svc=$(ssh_service_state); then color=$GREEN; else color=$RED; fi
+    printf 'SSH 服务: %s%s%s\n' "$color" "$svc" "$PLAIN"
 
     echo
-    printf '%s========== 结论 ==========%s\n' "$BOLD" "$PLAIN"
+    title 结论
     if (( n == 0 )) && [[ $pw == no ]]; then
         printf '%s❌ 密码登录已关闭，但没有任何公钥！请不要断开当前连接，立即写入公钥或恢复密码登录%s\n' "$RED" "$PLAIN"
     elif [[ $pub == yes && $pw == no && $kbd != yes ]] && (( n > 0 )); then
@@ -1385,8 +1452,7 @@ ssh_status() {
             printf '%s  一旦 00-key-only.conf 被删除或系统重新配置，密码登录会悄悄恢复%s\n' "$YELLOW" "$PLAIN"
             sed 's/^/    /' <<<"$risks"
             echo
-            read -rp "是否现在加固 (把这些设置改为关闭)? [y/N]: " ans
-            [[ $ans == [yY] ]] && ssh_harden -y
+            confirm "是否现在加固 (把这些设置改为关闭)?" && ssh_harden -y
         fi
     elif [[ $pw == no ]]; then
         printf '%s⚠ 密码登录已关闭，但键盘交互登录仍开启，仍可能用密码登录%s\n' "$YELLOW" "$PLAIN"
@@ -1413,10 +1479,11 @@ ssh_log_source() {
     fi
 }
 
+# 读取 sshd 日志: $1 为日志来源，$2 为最近多少小时 (仅 journal 有效，为空表示全部)
 # OpenSSH 9.8 起登录相关日志由 sshd-session 进程输出
 ssh_log_lines() {
     if [[ $1 == journal ]]; then
-        journalctl -q -t sshd -t sshd-session --since "$2 hours ago" -o short-iso --no-pager 2>/dev/null
+        journalctl -q -t sshd -t sshd-session ${2:+--since "$2 hours ago"} -o short-iso --no-pager 2>/dev/null
     else
         grep -E ' sshd(-session)?\[' "$1" 2>/dev/null
     fi
@@ -1489,10 +1556,10 @@ ssh_login_log() {
     me=$(awk '{ print $1 }' <<<"${SSH_CONNECTION:-}")
 
     if [[ $src == journal ]]; then
-        printf '%s========== SSH 登录记录 (最近 %s 小时) ==========%s\n' "$BOLD" "$hours" "$PLAIN"
+        title "SSH 登录记录 (最近 $hours 小时)"
         printf '日志来源: systemd journal\n'
     else
-        printf '%s========== SSH 登录记录 ==========%s\n' "$BOLD" "$PLAIN"
+        title "SSH 登录记录"
         printf '日志来源: %s (文件里的全部记录: %s ~ %s)\n' "$src" "${first:--}" "${last:--}"
     fi
     echo
@@ -1551,11 +1618,8 @@ ssh_login_log() {
 key_login_events() {
     local src
     src=$(ssh_log_source)
-    case $src in
-        none) return 0 ;;
-        journal) journalctl -q -t sshd -t sshd-session -o short-iso --no-pager 2>/dev/null ;;
-        *) grep -E ' sshd(-session)?\[' "$src" 2>/dev/null ;;
-    esac | grep 'Accepted publickey' | awk '{
+    [[ $src == none ]] && return 0
+    ssh_log_lines "$src" | grep 'Accepted publickey' | awk '{
         t = $1
         if (t ~ /^[0-9][0-9][0-9][0-9]-/) { t = substr(t, 1, 16); sub("T", " ", t) } else t = $1 " " $2 " " $3
         ip = ""; pt = ""; f = ""
@@ -1568,14 +1632,20 @@ key_login_events() {
     }'
 }
 
+# 当前 SSH 连接所用公钥的指纹: $1 为 key_login_events 的输出
+current_key_fp() {
+    local ip port
+    read -r ip port _ <<<"${SSH_CONNECTION:-}"
+    [[ -n $port ]] || return 0
+    awk -F'|' -v ip="$ip" -v pt="$port" '$2 == ip && $3 == pt { f = $4 } END { print f }' <<<"$1"
+}
+
 # 显示带编号的公钥列表，标出最近使用时间和当前连接所用的密钥
 # 设置全局变量 KEY_LINES (编号对应的文件行号) 和 KEY_TOTAL
 print_keys_detail() {
-    local events cur me_ip me_port
+    local events cur
     events=$(key_login_events)
-    read -r me_ip me_port _ <<<"${SSH_CONNECTION:-}"
-    cur=""
-    [[ -n $me_port ]] && cur=$(awk -F'|' -v ip="$me_ip" -v pt="$me_port" '$2 == ip && $3 == pt { f = $4 } END { print f }' <<<"$events")
+    cur=$(current_key_fp "$events")
     KEY_LINES=$(key_entries | cut -d'|' -f1 | tr '\n' ' ')
     KEY_TOTAL=$(wc -w <<<"$KEY_LINES" | tr -d ' ')
     if (( KEY_TOTAL == 0 )); then
@@ -1594,8 +1664,8 @@ print_keys_detail() {
 
 # 把 "1,3" 这样的编号转为 authorized_keys 的行号 (从大到小，方便删除)
 pick_key_lines() {
-    local sel=${1// /} tok lines=() i
-    local -a map
+    local sel=${1// /} tok
+    local -a map toks lines=()
     read -ra map <<<"$KEY_LINES"
     [[ -n $sel ]] || return 1
     IFS=',' read -ra toks <<<"$sel"
@@ -1610,14 +1680,14 @@ pick_key_lines() {
 
 ssh_delete_keys() {
     need_root || return 1
-    local f sel lines n remain pw cur_fp cur_hit="" ans line me_ip me_port
+    local f sel lines n remain pw cur_fp cur_hit="" line entries
     f=$(auth_keys_file)
     echo "当前公钥:"
     print_keys_detail
     (( KEY_TOTAL > 0 )) || return 0
     echo
     read -rp "输入要删除的编号 (多个用逗号分隔，如 2,3；直接回车取消): " sel
-    [[ -n $sel ]] || { info "已取消"; return 0; }
+    [[ -n $sel ]] || { cancelled; return 0; }
     lines=$(pick_key_lines "$sel") || return 1
     n=$(grep -c . <<<"$lines")
     remain=$((KEY_TOTAL - n))
@@ -1630,20 +1700,18 @@ ssh_delete_keys() {
     (( remain == 0 )) && warn "删除后将没有任何公钥，只能用密码登录"
 
     # 检查是否包含当前连接使用的密钥
-    read -r me_ip me_port _ <<<"${SSH_CONNECTION:-}"
-    if [[ -n ${me_port:-} ]]; then
-        cur_fp=$(key_login_events | awk -F'|' -v ip="$me_ip" -v pt="$me_port" '$2 == ip && $3 == pt { f = $4 } END { print f }')
+    cur_fp=$(current_key_fp "$(key_login_events)")
+    if [[ -n $cur_fp ]]; then
+        entries=$(key_entries)
         for line in $lines; do
-            [[ -n $cur_fp && $(key_entries | awk -F'|' -v l="$line" '$1 == l { print $3 }') == "$cur_fp" ]] && cur_hit=1
+            [[ $(awk -F'|' -v l="$line" '$1 == l { print $3 }' <<<"$entries") == "$cur_fp" ]] && cur_hit=1
         done
     fi
     if [[ -n $cur_hit ]]; then
         warn "其中包含你当前连接正在使用的密钥！当前连接不会断开，但之后将无法再用它登录"
-        read -rp "确定删除请输入 yes: " ans
-        [[ $ans == yes ]] || { info "已取消"; return 0; }
+        confirm_yes "确定删除" || { cancelled; return 0; }
     else
-        read -rp "确认删除这 $n 个公钥? [y/N]: " ans
-        [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+        confirm "确认删除这 $n 个公钥?" || { cancelled; return 0; }
     fi
 
     cp -p "$f" "$f.bak-portman"
@@ -1670,7 +1738,7 @@ set_key_comment() {
 # 逐个询问每个公钥的备注，回车跳过
 ssh_rename_key() {
     need_root || return 1
-    local f e line type fp comment new changed=0 i=0
+    local f e line fp comment new changed=0 i=0
     local -a entries=()
     f=$(auth_keys_file)
     echo "当前公钥:"
@@ -1681,7 +1749,7 @@ ssh_rename_key() {
     cp -p "$f" "$f.bak-portman"
     while IFS= read -r e; do entries+=("$e"); done <<<"$(key_entries)"
     for e in "${entries[@]}"; do
-        IFS='|' read -r line type fp comment <<<"$e"
+        IFS='|' read -r line _ fp comment <<<"$e"
         i=$((i + 1))
         read -rp "  $i. ${fp:0:20}… 当前: $comment → " new || new=""
         new=$(tr -d '\r\n' <<<"$new")
@@ -1704,7 +1772,7 @@ ssh_rename_key() {
 #   参数: 指纹前缀=备注 ...  例如 FkK2Q24cqy46=iPhone
 ssh_label_keys() {
     need_root || return 1
-    local f arg pfx name entries line type fp comment hit applied=0
+    local f arg pfx name entries line fp hit applied=0
     (( $# > 0 )) || { error "用法: portman ssh label 指纹前缀=备注 ...  (指纹前缀可在「管理公钥」里生成)"; return 1; }
     f=$(auth_keys_file)
     [[ -s $f ]] || { error "$f 中没有公钥"; return 1; }
@@ -1716,7 +1784,7 @@ ssh_label_keys() {
         pfx=${pfx#SHA256:}
         if (( ${#pfx} < 6 )); then warn "指纹前缀太短 (至少 6 位): $pfx"; continue; fi
         hit=""
-        while IFS='|' read -r line type fp comment; do
+        while IFS='|' read -r line _ fp _; do
             if [[ ${fp#SHA256:} == "$pfx"* ]]; then
                 set_key_comment "$line" "$name" && hit=1
             fi
@@ -1732,8 +1800,8 @@ ssh_label_keys() {
 
 # 根据当前服务器上已有的备注，生成可在其他服务器执行的批量备注命令
 ssh_label_export() {
-    local cmd="portman ssh label" n=0 line type fp comment short
-    while IFS='|' read -r line type fp comment; do
+    local cmd="portman ssh label" n=0 fp comment short
+    while IFS='|' read -r _ _ fp comment; do
         [[ -z $fp || $fp == - || $comment == "(无备注)" ]] && continue
         short=${fp#SHA256:}; short=${short:0:12}
         cmd+=" $(printf '%q' "$short=$comment")"
@@ -1755,7 +1823,7 @@ ssh_keys_menu() {
     local c
     while true; do
         clear 2>/dev/null
-        printf '%s===== 管理公钥 =====%s\n' "$BOLD" "$PLAIN"
+        menu_title 管理公钥
         printf '公钥文件: %s\n\n' "$(auth_keys_file)"
         print_keys_detail
         echo
@@ -1799,7 +1867,7 @@ key_only_active() {
 
 ssh_harden() {
     need_root || return 1
-    local auto=${1:-} risks files f b err ans
+    local auto=${1:-} risks files f b err
     if ! key_only_active; then
         error "还没有开启「只允许密钥登录」，请先开启后再加固"
         return 1
@@ -1816,8 +1884,7 @@ ssh_harden() {
     echo
     echo "加固会把它们改为: PasswordAuthentication / KbdInteractiveAuthentication no，PermitRootLogin prohibit-password"
     if [[ $auto != -y ]]; then
-        read -rp "确认加固? [y/N]: " ans
-        [[ $ans == [yY] ]] || { info "已取消"; return 0; }
+        confirm "确认加固?" || { cancelled; return 0; }
     fi
 
     b=$(sshd_bin) || { error "未找到 sshd"; return 1; }
@@ -1845,7 +1912,7 @@ ssh_menu() {
     local c n pw
     while true; do
         clear 2>/dev/null
-        printf '%s===== SSH 密钥登录 =====%s\n' "$BOLD" "$PLAIN"
+        menu_title "SSH 密钥登录"
         if is_root; then
             n=$(key_count)
             pw=$(eff_get "$(sshd_effective)" passwordauthentication)
@@ -1879,16 +1946,9 @@ ssh_menu() {
     done
 }
 
-# ---------------------------------------------------------------------------
-# 更新 / 卸载
-# ---------------------------------------------------------------------------
-download() {
-    if has curl; then curl -fsSL "$1" -o "$2"
-    elif has wget; then wget -qO "$2" "$1"
-    else error "需要 curl 或 wget"; return 1
-    fi
-}
-
+# ===========================================================================
+# 6. 安装维护: 快捷键、更新、卸载、路由模块
+# ===========================================================================
 # 快捷命令 s / S 是指向 portman 的软链接
 is_our_shortcut() {
     [[ -L $1 && $(readlink -f "$1") == "$(readlink -f "$INSTALL_PATH")" ]]
@@ -1932,30 +1992,38 @@ remove_shortcuts() {
     done
 }
 
+# 下载仓库里的脚本并做语法检查: fetch_script <文件名> <保存到>
+fetch_script() {
+    download "$RAW_URL/$1" "$2" && bash -n "$2"
+}
+
+install_route_module() {
+    install -d -m 755 "${ROUTE_MODULE%/*}"
+    install -m 755 "$1" "$ROUTE_MODULE"
+}
+
 update_self() {
     need_root || return 1
     local tmp module_tmp new
     tmp=$(mktemp)
     module_tmp=$(mktemp)
     info "正在下载最新版本..."
-    # 两个文件都下载并通过语法检查后再替换，避免模块缺失使路由菜单不可用。
-    if download "$RAW_URL/portman.sh" "$tmp" && bash -n "$tmp" &&
-       download "$RAW_URL/route-report.sh" "$module_tmp" && bash -n "$module_tmp"; then
-        install -d -m 755 "${ROUTE_MODULE%/*}"
-        install -m 755 "$module_tmp" "$ROUTE_MODULE"
-        install -m 755 "$tmp" "$INSTALL_PATH"
-        rm -f "$tmp" "$module_tmp"
-        "$INSTALL_PATH" shortcut >/dev/null
-        new=$("$INSTALL_PATH" version)
-        if [[ $new == "portman v${VERSION}" ]]; then
-            info "已经是最新版本 ($new)。如果刚推送了新版本，GitHub 缓存可能要等几分钟"
-        else
-            info "已从 v${VERSION} 更新到 ${new#portman }"
-        fi
-    else
+    # 两个文件都下载并通过语法检查后再替换，避免模块缺失使路由菜单不可用
+    if ! fetch_script portman.sh "$tmp" || ! fetch_script route-report.sh "$module_tmp"; then
         rm -f "$tmp" "$module_tmp"
         error "下载或语法检查失败，未完成更新；请检查网络"
         return 1
+    fi
+    install_route_module "$module_tmp"
+    install -m 755 "$tmp" "$INSTALL_PATH"
+    rm -f "$tmp" "$module_tmp"
+
+    "$INSTALL_PATH" shortcut >/dev/null
+    new=$("$INSTALL_PATH" version)
+    if [[ $new == "portman v${VERSION}" ]]; then
+        info "已经是最新版本 ($new)。如果刚推送了新版本，GitHub 缓存可能要等几分钟"
+    else
+        info "已从 v${VERSION} 更新到 ${new#portman }"
     fi
 }
 
@@ -1972,28 +2040,56 @@ uninstall_self() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# 菜单与命令行
-# ---------------------------------------------------------------------------
+# 运行路由检测模块；模块不存在时先补装
+route_dispatch() {
+    if [[ ! -r $ROUTE_MODULE ]]; then
+        # 从 v1.6.x 升级时，旧版 update 只下载 portman.sh，
+        # 所以第一次进入路由功能时从同一仓库补装模块
+        need_root || return 1
+        local tmp
+        tmp=$(mktemp) || return 1
+        info "首次使用路由检测，正在补装官方仓库中的路由模块..."
+        if fetch_script route-report.sh "$tmp"; then
+            install_route_module "$tmp"
+            rm -f "$tmp"
+            info "路由模块已安装"
+        else
+            rm -f "$tmp"
+            error "路由模块下载或校验失败，请重试或执行 portman update"
+            return 1
+        fi
+    fi
+    bash "$ROUTE_MODULE" "$@"
+}
+
+# ===========================================================================
+# 7. 菜单与命令行
+# ===========================================================================
 usage() {
     cat <<EOF
 portman v${VERSION} - VPS 端口查看与管理工具
 
 快捷键: 输入 s (或 S) 回车，等同于 portman，直接打开菜单
 
-命令列表:
+【端口】
    1. portman                        打开交互菜单，输入数字选择功能
    2. portman list                   查看所有端口：正在监听的，以及已放行但未使用的
    3. portman public                 只看对公网开放的端口
    4. portman check <端口>           查询某个端口被哪个程序占用
    5. portman open  <端口> [协议]    放行(开启)端口，协议: tcp(默认) / udp / both
    6. portman close <端口> [协议]    关闭端口（删除防火墙放行规则）
+
+【防火墙】
    7. portman lockdown               一键关闭其他端口，只保留正在使用的端口和 SSH
    8. portman unlock                 恢复放行全部端口（撤销第 7 项）
    9. portman fw                     查看防火墙状态和规则
+
+【网络】
   10. portman ip                     查看 IPv4 / IPv6 状态（地址、路由、能否上网）
   11. portman ipv6 off               禁用 IPv6，重启后保持
   12. portman ipv6 on                启用 IPv6，重启后保持
+
+【SSH】
   13. portman ssh                    SSH 密钥登录管理菜单
   14. portman ssh status             查看公钥是否写入、密码登录是否关闭、配置是否生效
   15. portman ssh addkey <来源>      写入公钥，来源可以是 sshid.io 用户名 / 链接 / 公钥本身
@@ -2004,11 +2100,17 @@ portman v${VERSION} - VPS 端口查看与管理工具
   20. portman ssh harden [-y]        安全加固：把其他配置文件里残留的密码登录设置改为关闭
       portman ssh label 指纹前缀=备注 ...
                                      按指纹批量加备注，命令可在「管理公钥」里自动生成
-  21. portman route                   上海三网回程中文检测（默认）
-      portman route menu              路由检测菜单（北京/广州/苏州/自定义）
-      portman route mtr --save        MTR 稳定性检测 + 保存报告
-      portman route shanghai --detail 展示逐跳中文路径
-      portman route set suzhou ct IP  设置苏州电信测试 IP
+
+【三网路由检测】
+  21. portman route                  上海三网回程中文检测（默认）
+      portman route menu             路由检测菜单（北京/广州/苏州/自定义）
+      portman route mtr --save       MTR 稳定性检测 + 保存报告
+      portman route shanghai --detail
+                                     展示逐跳中文路径
+      portman route set suzhou ct IP 设置苏州电信测试 IP
+      portman route help             路由检测的全部用法
+
+【维护】
   22. portman update                 更新到最新版本
   23. portman uninstall              卸载 portman（不影响已有防火墙规则）
   24. portman version                查看当前版本
@@ -2029,48 +2131,53 @@ portman v${VERSION} - VPS 端口查看与管理工具
 EOF
 }
 
-pause() { read -rp "按回车键返回菜单..." _; }
-
+# 主菜单: 按类别分组显示，编号与旧版保持一致
 menu() {
     local c port proto
     while true; do
         clear 2>/dev/null
-        printf '%s===== portman v%s · 端口查看与管理 =====%s\n' "$BOLD" "$VERSION" "$PLAIN"
+        menu_title "portman v$VERSION · 端口查看与管理"
         if is_our_shortcut "$BIN_DIR/s"; then
-            printf '      快捷键: 任意位置输入 %ss%s 回车即可打开本菜单\n' "$CYAN" "$PLAIN"
+            printf '  快捷键: 任意位置输入 %ss%s 回车即可打开本菜单\n' "$CYAN" "$PLAIN"
         fi
         echo
-        echo "  1. 查看所有端口 (正在监听 + 已放行未使用)"
-        echo "  2. 只看对公网开放的端口"
-        echo "  3. 查询指定端口"
-        echo "  4. 放行(开启)端口"
-        echo "  5. 关闭端口"
-        echo "  6. 一键关闭其他端口 (只保留正在使用的端口)"
-        echo "  7. 恢复放行全部端口"
-        echo "  8. 查看防火墙状态"
-        echo "  9. 查看 IPv4 / IPv6 状态"
-        echo " 10. 开启 / 关闭 IPv6"
-        echo " 11. SSH 密钥登录 (写入公钥、只允许密钥登录)"
-        echo " 12. 更新 portman"
-        echo " 13. 卸载 portman"
-        echo " 14. 三网路由检测 (NextTrace 中文报告)"
-        echo "  0. 退出"
+        menu_group "端口"
+        echo "   1. 查看所有端口 (正在监听 + 已放行未使用)"
+        echo "   2. 只看对公网开放的端口"
+        echo "   3. 查询指定端口"
+        echo "   4. 放行(开启)端口"
+        echo "   5. 关闭端口"
+        menu_group "防火墙"
+        echo "   6. 一键关闭其他端口 (只保留正在使用的端口)"
+        echo "   7. 恢复放行全部端口"
+        echo "   8. 查看防火墙状态"
+        menu_group "网络"
+        echo "   9. 查看 IPv4 / IPv6 状态"
+        echo "  10. 开启 / 关闭 IPv6"
+        echo "  14. 三网路由检测 (NextTrace 中文报告)"
+        menu_group "SSH"
+        echo "  11. SSH 密钥登录 (写入公钥、只允许密钥登录)"
+        menu_group "维护"
+        echo "  12. 更新 portman"
+        echo "  13. 卸载 portman"
+        echo
+        echo "   0. 退出"
         echo
         read -rp "请选择 [0-14]: " c
         echo
         case $c in
-            1) show_ports all ;;
-            2) show_ports public ;;
-            3) read -rp "端口号: " port
-               if [[ $port =~ ^[0-9]+$ ]]; then show_ports "$port"; else error "请输入单个端口号"; fi ;;
+            1)  show_ports all ;;
+            2)  show_ports public ;;
+            3)  read -rp "端口号: " port
+                if [[ $port =~ ^[0-9]+$ ]]; then show_ports "$port"; else error "请输入单个端口号"; fi ;;
             4|5)
-               read -rp "端口 (如 8080 / 80,443 / 8000-8100): " port
-               read -rp "协议 tcp/udp/both [默认 tcp]: " proto
-               if [[ $c == 4 ]]; then open_port "$port" "${proto:-tcp}"; else close_port "$port" "${proto:-tcp}"; fi ;;
-            6) lockdown ;;
-            7) unlock ;;
-            8) show_firewall ;;
-            9) show_ip_status ;;
+                read -rp "端口 (如 8080 / 80,443 / 8000-8100): " port
+                read -rp "协议 tcp/udp/both [默认 tcp]: " proto
+                if [[ $c == 4 ]]; then open_port "$port" "${proto:-tcp}"; else close_port "$port" "${proto:-tcp}"; fi ;;
+            6)  lockdown ;;
+            7)  unlock ;;
+            8)  show_firewall ;;
+            9)  show_ip_status ;;
             10) ipv6_menu ;;
             11) ssh_menu; continue ;;
             12) if update_self; then
@@ -2081,33 +2188,11 @@ menu() {
             13) uninstall_self && exit 0 ;;
             14) route_dispatch menu; continue ;;
             0|q) exit 0 ;;
-            *) error "无效选择" ;;
+            *)  error "无效选择" ;;
         esac
         echo
         pause
     done
-}
-
-route_dispatch() {
-    if [[ ! -r $ROUTE_MODULE ]]; then
-        # 从 v1.6.x 升级时，旧版 update 仅下载 portman.sh。
-        # 首次进入路由菜单时再从同一仓库补装模块，兼容旧版本的一次更新。
-        need_root || return 1
-        local tmp
-        tmp=$(mktemp) || return 1
-        info "首次使用路由检测，正在补装官方仓库中的路由模块..."
-        if download "$RAW_URL/route-report.sh" "$tmp" && bash -n "$tmp"; then
-            install -d -m 755 "${ROUTE_MODULE%/*}"
-            install -m 755 "$tmp" "$ROUTE_MODULE"
-            rm -f "$tmp"
-            info "路由模块已安装"
-        else
-            rm -f "$tmp"
-            error "路由模块下载或校验失败，请重试或执行 portman update"
-            return 1
-        fi
-    fi
-    bash "$ROUTE_MODULE" "$@"
 }
 
 main() {
@@ -2155,7 +2240,7 @@ main() {
     esac
 }
 
-# 被 source 时只加载函数(便于测试)
+# 被 source 时只加载函数 (便于测试)
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     main "$@"
 fi
