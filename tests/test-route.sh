@@ -47,7 +47,7 @@ fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 expect() { grep -Fq -- "$2" "$1" || fail "未匹配：$2"; }
 
 bash portman.sh version > "$work/version"
-expect "$work/version" 'portman v1.7.0'
+expect "$work/version" 'portman v1.7.1'
 bash route-report.sh shanghai > "$work/shanghai"
 expect "$work/shanghai" '经过电信 CN2'
 expect "$work/shanghai" '经过联通 9929，随后经过 4837'
