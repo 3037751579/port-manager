@@ -1,0 +1,26 @@
+name: Route diagnostics tests
+on:
+  push:
+    branches: [feature/route-diagnostics, main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  route-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check dependencies
+        run: |
+          bash --version
+          jq --version
+          command -v shellcheck || true
+      - name: Run offline NextTrace mock tests
+        run: bash tests/test-route.sh
+      - name: ShellCheck new module
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -S error route-report.sh
+          fi
