@@ -24,7 +24,7 @@ route_city() {
     esac
 }
 route_city_cn() {
-    case $1 in shanghai) echo 上海;; beijing) echo 北京;; guangzhou) echo 广州;; suzhou) echo 苏州;; esac
+    case $1 in shanghai) echo 上海;; beijing) echo 北京;; guangzhou) echo 广州;; suzhou) echo 苏州;; custom) echo 自定义;; esac
 }
 route_isp() {
     case ${1:-} in
@@ -125,6 +125,7 @@ route_install_deps() {
 # 也绝不将 CN2 简单标成 CN2 GIA。
 route_label() {
     local asn=${1#AS} ip=${2:-} owner=${3:-}
+    [[ $asn == '-' ]] && asn=''
     if [[ $ip == 59.43.* ]]; then echo '电信 CN2 骨干'; return; fi
     case $asn in
         4809) echo '电信 CN2 骨干';;
@@ -164,7 +165,7 @@ route_render() {
     [[ $reason == max_hops ]] && reached='达到最大跳数'
     [[ $(jq -r '.end_reason // "completed"' "$file") == completed ]] || reached='检测异常/中断'
 
-    rows=$(jq -r '.stats[] | [.ttl // 0, .ip // "*", .geo.asnumber // "", .avg_ms // 0, .received // 0, .loss_percent // 0, .stdev_ms // 0, .geo.country // "", .geo.prov // "", .geo.city // "", (.geo.owner // .geo.isp // "")] | map(tostring) | @tsv' "$file")
+    rows=$(jq -r '.stats[] | [.ttl // 0, .ip // "*", .geo.asnumber // "-", .avg_ms // 0, .received // 0, .loss_percent // 0, .stdev_ms // 0, .geo.country // "-", .geo.prov // "-", .geo.city // "-", (.geo.owner // .geo.isp // "-")] | map(tostring) | @tsv' "$file")
     if [[ $detail == 1 ]]; then
         printf '\n  ── %s%s · %s ──\n' "$(route_city_cn "$city")" "$cn" "$ip"
         printf '  跳点  IP / ASN / 中文线路                       平均延迟\n'
@@ -367,7 +368,7 @@ route_main() {
     if [[ ${1:-} == custom ]]; then
         shift
         local target=${1:-}
-        shift 2>/dev/null || true
+        shift || true
         for a in "$@"; do case $a in --detail) detail=1;; --save) save=1;; --mtr) mtr=1;; *) route_err "未知参数：$a"; return 2;; esac; done
         route_custom "$target" "$detail" "$mtr" "$save"
         return
