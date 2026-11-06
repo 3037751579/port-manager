@@ -155,7 +155,7 @@ route_render() {
     local file=$1 city=$2 isp=$3 ip=$4 detail=$5 mtr=$6 summary_file=${7:--}
     local c cn reached reason endhop resolved rows first_hop=0
     local ttl hopip asn avg received loss stdev country prov loc owner label sig
-    local last_sig="" path="" seen_cn2=0 seen_9929=0 seen_4837=0 seen_cmin2=0 seen_cmi=0 seen_163=0
+    local last_sig="" path="" seen_cn2=0 seen_9929=0 seen_4837=0 seen_4837_after_9929=0 seen_cmin2=0 seen_cmi=0 seen_163=0
     local endavg='—' endloss='—' endjitter='—' endrecv=0 summary='未识别'
     cn=$(route_isp_cn "$isp")
     reason=$(jq -r '.path_end.reason // "unknown"' "$file")
@@ -177,7 +177,10 @@ route_render() {
         label=$(route_label "$asn" "$hopip" "$owner")
         [[ $hopip == 59.43.* || ${asn#AS} == 4809 ]] && seen_cn2=1
         [[ ${asn#AS} == 9929 ]] && seen_9929=1
-        [[ ${asn#AS} == 4837 ]] && seen_4837=1
+        if [[ ${asn#AS} == 4837 ]]; then
+            seen_4837=1
+            ((seen_9929)) && seen_4837_after_9929=1
+        fi
         [[ ${asn#AS} == 58807 ]] && seen_cmin2=1
         [[ ${asn#AS} == 58453 ]] && seen_cmi=1
         [[ ${asn#AS} == 4134 ]] && seen_163=1
@@ -192,7 +195,7 @@ route_render() {
             [[ $mtr == 1 ]] && printf ' · 丢包: %.1f%% · 样本: %s' "$loss" "$received"
             printf '\n'
         fi
-        if [[ $reached == '已到达' ]] && { [[ $hopip == "$resolved" || $hopip == "$ip" ]] || [[ $ttl == "$endhop" && "$endrecv" == 0 ]]; }; then
+        if [[ $reached == '已到达' ]] && { [[ $hopip == "$resolved" || $hopip == "$ip" ]]; }; then
             endavg=$(printf '%.1fms' "$avg")
             endloss=$(printf '%.1f%%' "$loss")
             endjitter=$(printf '%.1fms' "$stdev")
@@ -208,7 +211,8 @@ route_render() {
         unicom)
             if ((seen_9929)); then
                 summary='经过联通 9929'
-                ((seen_4837)) && summary+='，随后经过 4837'
+                if ((seen_4837_after_9929)); then summary+='，随后经过 4837'
+                elif ((seen_4837)); then summary+='，同时出现 4837（顺序不确定）'; fi
             elif ((seen_4837)); then summary='经过联通 4837，未见 9929'
             else summary='证据不足，未识别联通骨干'; fi ;;
         mobile)
