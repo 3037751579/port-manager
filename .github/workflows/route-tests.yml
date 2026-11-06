@@ -19,8 +19,15 @@ jobs:
           command -v shellcheck || true
       - name: Run offline NextTrace mock tests
         run: bash tests/test-route.sh
+      - name: Missing-dependency installation regression tests
+        run: sudo bash tests/test-deps.sh
       - name: Offline installer and updater integration test
         run: sudo bash tests/test-install.sh
+      - name: Install real NextTrace via route dependency installer
+        run: |
+          printf 'y\n' | sudo bash route-report.sh install
+          sudo bash route-report.sh doctor
+          test -x /usr/local/bin/nexttrace
       - name: NextTrace v1.7.5 real JSON smoke test (loopback)
         run: |
           curl -fLsS --retry 2 --max-time 60 -o "$RUNNER_TEMP/nexttrace" \

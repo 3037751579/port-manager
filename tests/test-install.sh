@@ -34,7 +34,7 @@ export PATH="$temp/bin:$PATH" MOCK_SOURCE_DIR="$source_dir"
 bash install.sh > "$temp/install.log"
 test -x /usr/local/bin/portman
 test -x /usr/local/lib/portman/route-report.sh
-/usr/local/bin/portman version | grep -Fq 'v1.7.0'
+/usr/local/bin/portman version | grep -Fq 'v1.7.1'
 /usr/local/bin/portman route help > "$temp/route-help"
 grep -Fq '默认上海三网快速测试' "$temp/route-help"
 
