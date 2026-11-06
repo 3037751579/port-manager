@@ -64,7 +64,7 @@ bash route-report.sh shanghai unicom --detail > "$work/detail"
 expect "$work/detail" '中国联通 9929'
 expect "$work/detail" '219.158.120.17'
 bash route-report.sh shanghai mobile --mtr --save > "$work/mtr"
-expect "$work/mtr" '终点丢包: 0.0%'
+expect "$work/mtr" 'MTR：终点丢包 0.0%'
 expect "$MOCK_TRACE_LOG" '-q 20'
 test -f "$(find "$work/reports" -name 'shanghai-mobile.json' -print -quit)" || fail '原始 JSON 未保存'
 test -f "$(find "$work/reports" -name 'summary.txt' -print -quit)" || fail 'TXT 未保存'
