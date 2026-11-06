@@ -2090,8 +2090,22 @@ menu() {
 
 route_dispatch() {
     if [[ ! -r $ROUTE_MODULE ]]; then
-        error "路由检测模块未安装，请执行 portman update 重新安装"
-        return 1
+        # 从 v1.6.x 升级时，旧版 update 仅下载 portman.sh。
+        # 首次进入路由菜单时再从同一仓库补装模块，兼容旧版本的一次更新。
+        need_root || return 1
+        local tmp
+        tmp=$(mktemp) || return 1
+        info "首次使用路由检测，正在补装官方仓库中的路由模块..."
+        if download "$RAW_URL/route-report.sh" "$tmp" && bash -n "$tmp"; then
+            install -d -m 755 "${ROUTE_MODULE%/*}"
+            install -m 755 "$tmp" "$ROUTE_MODULE"
+            rm -f "$tmp"
+            info "路由模块已安装"
+        else
+            rm -f "$tmp"
+            error "路由模块下载或校验失败，请重试或执行 portman update"
+            return 1
+        fi
     fi
     bash "$ROUTE_MODULE" "$@"
 }
