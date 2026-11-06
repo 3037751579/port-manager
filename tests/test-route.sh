@@ -77,7 +77,7 @@ expect "$work/suzhou2" '8.8.8.8'
 bash route-report.sh custom 1.1.1.1 --detail > "$work/custom"
 expect "$work/custom" '203.0.113.1'
 expect "$work/custom" '未确认到达'
-expect "$work/custom" '终点: —'
+expect "$work/custom" '延迟：—'
 if bash route-report.sh custom ';rm -rf /' > "$work/invalid" 2>&1; then fail '危险地址应被拒绝'; fi
 
 # 普通线路也必须直接展示实际经过的网络，不出现“未见精品网”式评价。
