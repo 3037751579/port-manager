@@ -5,11 +5,12 @@
 #
 # 仓库: https://github.com/Eggfin/port-manager
 
-VERSION="1.6.2"
+VERSION="1.7.0"
 REPO="Eggfin/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
 BIN_DIR="/usr/local/bin"
+ROUTE_MODULE="/usr/local/lib/portman/route-report.sh"
 SHORTCUTS="s S"
 
 if [[ -t 1 ]]; then
@@ -1933,12 +1934,17 @@ remove_shortcuts() {
 
 update_self() {
     need_root || return 1
-    local tmp new
+    local tmp module_tmp new
     tmp=$(mktemp)
+    module_tmp=$(mktemp)
     info "正在下载最新版本..."
-    if download "$RAW_URL/portman.sh" "$tmp" && bash -n "$tmp"; then
+    # 两个文件都下载并通过语法检查后再替换，避免模块缺失使路由菜单不可用。
+    if download "$RAW_URL/portman.sh" "$tmp" && bash -n "$tmp" &&
+       download "$RAW_URL/route-report.sh" "$module_tmp" && bash -n "$module_tmp"; then
+        install -d -m 755 "${ROUTE_MODULE%/*}"
+        install -m 755 "$module_tmp" "$ROUTE_MODULE"
         install -m 755 "$tmp" "$INSTALL_PATH"
-        rm -f "$tmp"
+        rm -f "$tmp" "$module_tmp"
         "$INSTALL_PATH" shortcut >/dev/null
         new=$("$INSTALL_PATH" version)
         if [[ $new == "portman v${VERSION}" ]]; then
@@ -1947,8 +1953,8 @@ update_self() {
             info "已从 v${VERSION} 更新到 ${new#portman }"
         fi
     else
-        rm -f "$tmp"
-        error "下载失败，请检查网络"
+        rm -f "$tmp" "$module_tmp"
+        error "下载或语法检查失败，未完成更新；请检查网络"
         return 1
     fi
 }
@@ -1958,6 +1964,8 @@ uninstall_self() {
     remove_shortcuts
     remove_restore_service
     rm -rf "$INSTALL_PATH" "${STATE_FILE%/*}"
+    rm -f "$ROUTE_MODULE"
+    rmdir "${ROUTE_MODULE%/*}" 2>/dev/null || true
     info "portman 已卸载 (当前防火墙规则保持不变，但重启后不再自动恢复 iptables 规则)"
     if [[ -f $SYSCTL_FILE ]]; then
         warn "IPv6 仍保持禁用。如需恢复，删除 $SYSCTL_FILE 后重启"
@@ -1996,9 +2004,14 @@ portman v${VERSION} - VPS 端口查看与管理工具
   20. portman ssh harden [-y]        安全加固：把其他配置文件里残留的密码登录设置改为关闭
       portman ssh label 指纹前缀=备注 ...
                                      按指纹批量加备注，命令可在「管理公钥」里自动生成
-  21. portman update                 更新到最新版本
-  22. portman uninstall              卸载 portman（不影响已有防火墙规则）
-  23. portman version                查看当前版本
+  21. portman route                   上海三网回程中文检测（默认）
+      portman route menu              路由检测菜单（北京/广州/苏州/自定义）
+      portman route mtr --save        MTR 稳定性检测 + 保存报告
+      portman route shanghai --detail 展示逐跳中文路径
+      portman route set suzhou ct IP  设置苏州电信测试 IP
+  22. portman update                 更新到最新版本
+  23. portman uninstall              卸载 portman（不影响已有防火墙规则）
+  24. portman version                查看当前版本
 
 端口写法:
   8080          单个端口
@@ -2040,9 +2053,10 @@ menu() {
         echo " 11. SSH 密钥登录 (写入公钥、只允许密钥登录)"
         echo " 12. 更新 portman"
         echo " 13. 卸载 portman"
+        echo " 14. 三网路由检测 (NextTrace 中文报告)"
         echo "  0. 退出"
         echo
-        read -rp "请选择 [0-13]: " c
+        read -rp "请选择 [0-14]: " c
         echo
         case $c in
             1) show_ports all ;;
@@ -2065,12 +2079,35 @@ menu() {
                     exec "$INSTALL_PATH"
                 fi ;;
             13) uninstall_self && exit 0 ;;
+            14) route_dispatch menu; continue ;;
             0|q) exit 0 ;;
             *) error "无效选择" ;;
         esac
         echo
         pause
     done
+}
+
+route_dispatch() {
+    if [[ ! -r $ROUTE_MODULE ]]; then
+        # 从 v1.6.x 升级时，旧版 update 仅下载 portman.sh。
+        # 首次进入路由菜单时再从同一仓库补装模块，兼容旧版本的一次更新。
+        need_root || return 1
+        local tmp
+        tmp=$(mktemp) || return 1
+        info "首次使用路由检测，正在补装官方仓库中的路由模块..."
+        if download "$RAW_URL/route-report.sh" "$tmp" && bash -n "$tmp"; then
+            install -d -m 755 "${ROUTE_MODULE%/*}"
+            install -m 755 "$tmp" "$ROUTE_MODULE"
+            rm -f "$tmp"
+            info "路由模块已安装"
+        else
+            rm -f "$tmp"
+            error "路由模块下载或校验失败，请重试或执行 portman update"
+            return 1
+        fi
+    fi
+    bash "$ROUTE_MODULE" "$@"
 }
 
 main() {
@@ -2108,6 +2145,7 @@ main() {
                 harden)       ssh_harden "${3:-}" ;;
                 *)            ssh_menu ;;
             esac ;;
+        route)           shift; route_dispatch "$@" ;;
         update)          update_self ;;
         uninstall)       uninstall_self ;;
         shortcut)        setup_shortcuts ;;

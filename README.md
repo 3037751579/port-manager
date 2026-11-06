@@ -43,6 +43,11 @@ curl -fsSL https://raw.githubusercontent.com/Eggfin/port-manager/main/install.sh
 | `portman unlock` | 恢复放行全部端口（撤销 lockdown） |
 | `portman fw` | 查看防火墙状态和规则 |
 | `portman ip` | 查看 IPv4 / IPv6 状态：是否启用、地址、默认路由、能否访问外网 |
+| `portman route` | 默认测试上海电信、联通、移动的 VPS 回程线路 |
+| `portman route menu` | 打开三网路由菜单，支持北上广苏及自定义目标 |
+| `portman route beijing --detail` | 中文逐跳、IP、ASN、位置及延迟 |
+| `portman route mtr shanghai --save` | 多次探测终点丢包/延迟波动，保存 TXT 和 JSON |
+| `portman route set suzhou ct IP` | 保存苏州电信的测试目标（联通 cu、移动 cm） |
 | `portman ipv6 off` | 禁用 IPv6，重启后保持 |
 | `portman ipv6 on` | 启用 IPv6，重启后保持 |
 | `portman ssh` | SSH 密钥登录管理菜单 |
@@ -75,6 +80,32 @@ udp   51820   公网   未放行   -               0.0.0.0                   -
 - **范围**：`公网` 表示监听在 0.0.0.0 / :: 等对外地址，`本机` 表示只监听 127.0.0.1，外部无法访问
 - **防火墙**：本机防火墙是否放行该端口（仅对公网端口有意义）
 - **进程(PID)**：占用该端口的程序和进程号
+
+## NextTrace 中文三网回程测试（v1.7.0 新增）
+
+这是一个**独立于防火墙和 SSH 的只读网络诊断模块**。原有端口管理功能不受影响。全新安装会同时安装 `route-report.sh`；从 v1.6.x 升级时，由于旧更新器只下载主脚本，**第一次进入路由功能会自动从同一仓库补装模块**。之后 `portman update` 会同时更新两者。实际运行诊断需要 `nexttrace` 和 `jq`。
+
+```bash
+portman update                       # 从 main 拉取最新版主程序和路由模块
+portman route                        # 默认上海三网快速测试
+portman route shanghai --detail      # 显示中文逐跳明细
+portman route beijing --save         # 北京三网 + 保存报告
+portman route guangzhou cu           # 仅测试广州联通
+portman route mtr shanghai --save    # MTR，每跳 20 次探测
+portman route custom 1.1.1.1 --detail
+portman route menu                   # 交互菜单
+```
+
+- **预置地区**：上海（默认）、北京、广州，均覆盖电信/联通/移动。
+- **苏州**：考虑到公开目标地址不一定属于苏州或长期可达，暂不预置未经核实的三网 IP。首次使用前分别运行 `portman route set suzhou ct 目标IP`、`cu`、`cm` 保存地址；之后可直接 `portman route suzhou`。同样支持覆盖其他地区预置目标。
+- **线路识别**：识别电信 CN2（AS4809 / 59.43）、163（AS4134）、联通 AS10099 / AS9929 / AS4837、移动 CMIN2（AS58807）/ CMI（AS58453）等，保留混合骨干路径。
+- **显示原则**：只说「经过 CN2、9929、CMIN2」，不凭单次 traceroute 宣称全程专线或 CN2 GIA；最终目标未确认到达时不虚报终点延迟。
+- **稳定性**：`--mtr` 使用 NextTrace 的 `-r --json -q 20`，输出终点丢包及延迟标准差。中间跳不回应/丢包可能是 ICMP 限速，不能直接推断真实业务丢包。
+- **报告**：`--save` 将 `summary.txt` 及每条线路的原始 JSON 保存到 `~/portman-reports/`（可通过 `PORTMAN_ROUTE_REPORTS` 自定义目录）。配套命令可验证原始结果。
+- **依赖**：进入路由子菜单选「安装检测依赖」（会确认后安装），或自行安装 `nexttrace`、`jq`。模块不会静默执行安装或修改系统防火墙。
+- **方向限制**：在 VPS 上运行只能测试 VPS → 国内目标的**回程**；国内 → VPS 的去程需要在国内网络测试，不能通过此模块冒充去程结果。
+
+GitHub Actions 的 `tests/test-route.sh` 使用**模拟 NextTrace JSON** 验证脚本逻辑。真实路由、接口路由策略、丢包和晚高峰数据必须在实际 VPS 上复测。
 
 ## 支持的防火墙
 
