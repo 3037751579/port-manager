@@ -223,26 +223,49 @@ route_install_deps() {
 
 # 仅根据实际可见的 ASN/IP 判断，不把经过某条优质骨干等同于全程优质，
 # 也绝不将 CN2 简单标成 CN2 GIA。
+route_owner_name() {
+    local original=${1:-} lower=${1,,}
+    case $lower in
+        *iij.ad.jp*|*internet-initiative*|*iij*) echo 'IIJ 日本网络' ;;
+        *ntt.net*|*ntt.com*|*ntt\ *) echo 'NTT 国际网络' ;;
+        *lumen*|*level3*) echo 'Lumen 国际网络' ;;
+        *cogent*) echo 'Cogent 国际网络' ;;
+        *hurricane*|*he.net*) echo 'Hurricane Electric' ;;
+        *hyn.ink*|*hyw.ink*) echo "$original" ;;
+        *) echo "$original" ;;
+    esac
+}
+# 优先采用可核实的 ASN / IP 网络身份；不按“是否精品网”筛选路由。
 route_label() {
     local asn=${1#AS} ip=${2:-} owner=${3:-}
     [[ $asn == '-' ]] && asn=''
     [[ $owner == '-' ]] && owner=''
-    if [[ $ip == 59.43.* ]]; then echo '电信 CN2 骨干'; return; fi
+    if [[ $ip == 59.43.* ]]; then echo '中国电信 CN2'; return; fi
     case $asn in
-        4809) echo '电信 CN2 骨干';;
-        4134) echo '电信 163 骨干';;
-        4812|134774|140293) echo '电信国内接入';;
-        10099) echo '联通国际 CUG';;
-        9929) echo '联通 9929 精品骨干';;
-        4837) echo '联通 169 普通骨干';;
-        17621|140717) echo '联通国内接入';;
-        58807) echo '移动 CMIN2 国际精品网';;
-        58453) echo '移动 CMI 国际网';;
-        9808) echo '移动国内骨干';;
-        24400|56040|56041) echo '移动国内接入/骨干';;
-        1054) echo '上游网络（AS1054）';;
-        '') echo "${owner:-未识别}";;
-        *) echo "${owner:-其他网络}";;
+        4809) echo '中国电信 CN2';;
+        4134) echo '中国电信 163';;
+        4812|134774|140293) echo '中国电信本地网络';;
+        10099) echo '中国联通国际 CUG';;
+        9929) echo '中国联通 9929';;
+        4837) echo '中国联通 169';;
+        17621|140717) echo '中国联通本地网络';;
+        58807) echo '中国移动 CMIN2';;
+        58453) echo '中国移动 CMI';;
+        9808) echo '中国移动国内骨干';;
+        24400|56040|56041) echo '中国移动本地网络';;
+        2497) echo 'IIJ 日本网络';;
+        2914) echo 'NTT 国际网络';;
+        3356) echo 'Lumen 国际网络';;
+        174) echo 'Cogent 国际网络';;
+        6939) echo 'Hurricane Electric';;
+        1299) echo 'Arelion 国际网络';;
+        1054) echo 'AS1054 上游网络';;
+        '') if [[ -n $owner ]]; then route_owner_name "$owner"; else echo '未识别网络'; fi ;;
+        *) if [[ -n $owner ]]; then
+               printf '%s (AS%s)\n' "$(route_owner_name "$owner")" "$asn"
+           else
+               printf 'AS%s 网络\n' "$asn"
+           fi ;;
     esac
 }
 
@@ -303,34 +326,34 @@ route_render() {
         fi
     done <<< "$rows"
 
+    # 网络特征只出现在最终汇总中；每条线路的主体直接展示实际经过的网络。
     case $isp in
         telecom)
-            if ((seen_cn2)); then summary='经过电信 CN2'
-            elif ((seen_163)); then summary='看到电信 163，未见 CN2'
-            else summary='证据不足，未识别电信骨干'; fi ;;
+            if ((seen_cn2)); then summary='中国电信 CN2'
+            elif ((seen_163)); then summary='中国电信 163'
+            else summary='网络特征待确认'; fi ;;
         unicom)
             if ((seen_9929)); then
-                summary='经过联通 9929'
-                if ((seen_4837_after_9929)); then summary+='，随后经过 4837'
-                elif ((seen_4837)); then summary+='，同时出现 4837（顺序不确定）'; fi
-            elif ((seen_4837)); then summary='经过联通 4837，未见 9929'
-            else summary='证据不足，未识别联通骨干'; fi ;;
+                summary='中国联通 9929'
+                if ((seen_4837_after_9929)); then summary+=' → 169'
+                elif ((seen_4837)); then summary+=' / 169'; fi
+            elif ((seen_4837)); then summary='中国联通 169'
+            else summary='网络特征待确认'; fi ;;
         mobile)
-            if ((seen_cmin2)); then summary='经过移动 CMIN2'
-            elif ((seen_cmi)); then summary='经过移动 CMI，未见 CMIN2'
-            else summary='证据不足，未识别移动国际骨干'; fi ;;
-        custom) summary='自定义目标：仅展示可见路径' ;;
+            if ((seen_cmin2)); then summary='中国移动 CMIN2'
+            elif ((seen_cmi)); then summary='中国移动 CMI'
+            elif [[ $path == *'中国移动国内骨干'* ]]; then summary='中国移动国内骨干'
+            else summary='网络特征待确认'; fi ;;
+        custom) summary='自定义目标' ;;
     esac
 
-    printf '\n  %-6s  目标: %-15s  %s\n' "$cn" "$ip" "$reached"
-    printf '  线路: %s\n' "$summary"
-    printf '  终点: %s  ·  抵达跳数: %s' "$endavg" "${endhop:-0}"
-    [[ $mtr == 1 ]] && printf '  ·  终点丢包: %s  ·  延迟标准差: %s' "$endloss" "$endjitter"
-    printf '\n'
+    printf '\n  %s → %s\n' "$cn" "$ip"
+    printf '  状态：%s  ·  延迟：%s  ·  跳数：%s\n' "$reached" "$endavg" "${endhop:-0}"
+    printf '  经过：%s\n' "${path:-没有可识别的网络跳点}"
+    [[ $mtr == 1 ]] && printf '  MTR：终点丢包 %s · 延迟标准差 %s\n' "$endloss" "$endjitter"
     if [[ $summary_file != '-' ]]; then
         printf '%s%s | %s | %s | %s\n' "$(route_city_cn "$city")" "$cn" "$reached" "$endavg" "$summary" >> "$summary_file"
     fi
-    printf '  路径: %s\n' "${path:-无可识别跳点}"
     if [[ $mtr == 1 ]]; then
         printf '  注: 中间跳丢包可能是 ICMP 限速；重点看最终目标丢包。\n'
     fi
@@ -391,12 +414,13 @@ route_run_inner() {
         route_probe_one "$city" "$current" "$ip" "$detail" "$mtr" "$outputdir" "$summary_file" || failures=$((failures+1))
     done
     echo
-    printf '=============== 本次路由汇总 ===============\n'
+    printf '================ 本次路由汇总 ================\n'
+    printf '地区/运营商 | 状态 | 终点延迟 | 经过的骨干网络\n'
     cat "$summary_file"
     printf '============================================\n'
     rm -f "$summary_file"
     route_note "本次测试结束：$((${#carriers[@]}-failures))/${#carriers[@]} 个目标产生有效报告。"
-    route_note '线路标签代表经过该骨干，不代表全程专线；单次 ICMP 不等于晚高峰真实业务质量。'
+    route_note '汇总仅描述实际观测到的骨干；未出现的网络不单独作负面评价。'
     route_note 'VPS 上仅能直接测回程；去程必须由中国境内的测点发起。'
     (( failures == 0 ))
 }
