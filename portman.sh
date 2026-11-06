@@ -5,7 +5,7 @@
 #
 # 仓库: https://github.com/Eggfin/port-manager
 
-VERSION="1.7.0"
+VERSION="1.7.1"
 REPO="Eggfin/port-manager"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main"
 INSTALL_PATH="/usr/local/bin/portman"
