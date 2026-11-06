@@ -44,7 +44,7 @@ MOCK
 chmod +x "$work/bin/nexttrace"
 
 fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
-expect() { grep -Fq "$2" "$1" || fail "未匹配：$2"; }
+expect() { grep -Fq -- "$2" "$1" || fail "未匹配：$2"; }
 
 bash portman.sh version > "$work/version"
 expect "$work/version" 'portman v1.7.0'
