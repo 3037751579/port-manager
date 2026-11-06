@@ -38,6 +38,12 @@ test -x /usr/local/lib/portman/route-report.sh
 /usr/local/bin/portman route help > "$temp/route-help"
 grep -Fq '默认上海三网快速测试' "$temp/route-help"
 
+# 旧版 portman 仅更新主文件时，新版本首次调用应补装路由模块。
+rm -f /usr/local/lib/portman/route-report.sh
+/usr/local/bin/portman route help > "$temp/lazy-install.log"
+test -x /usr/local/lib/portman/route-report.sh
+grep -Fq '路由模块已安装' "$temp/lazy-install.log"
+
 # 中途下载失败不应更改已安装的主程序/模块
 if FAKE_FAIL_MODULE=1 /usr/local/bin/portman update > "$temp/fail.log" 2>&1; then
     echo 'FAILED: update should fail if module unavailable' >&2
