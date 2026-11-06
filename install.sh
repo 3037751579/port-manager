@@ -8,6 +8,8 @@ set -e
 REPO="Eggfin/port-manager"
 URL="https://raw.githubusercontent.com/${REPO}/main/portman.sh"
 INSTALL_PATH="/usr/local/bin/portman"
+ROUTE_MODULE="/usr/local/lib/portman/route-report.sh"
+ROUTE_URL="https://raw.githubusercontent.com/${REPO}/main/route-report.sh"
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; PLAIN=$'\033[0m'
 
@@ -31,19 +33,25 @@ if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
 fi
 
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+route_tmp=$(mktemp)
+trap 'rm -f "$tmp" "$route_tmp"' EXIT
 
 echo "${GREEN}[信息]${PLAIN} 正在下载 portman..."
 if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$URL" -o "$tmp"
+    curl -fsSL "$ROUTE_URL" -o "$route_tmp"
 elif command -v wget >/dev/null 2>&1; then
     wget -qO "$tmp" "$URL"
+    wget -qO "$route_tmp" "$ROUTE_URL"
 else
     echo "${RED}[错误]${PLAIN} 需要 curl 或 wget"
     exit 1
 fi
 
 bash -n "$tmp"
+bash -n "$route_tmp"
+install -d -m 755 "${ROUTE_MODULE%/*}"
+install -m 755 "$route_tmp" "$ROUTE_MODULE"
 install -m 755 "$tmp" "$INSTALL_PATH"
 
 echo "${GREEN}[信息]${PLAIN} 安装完成: $("$INSTALL_PATH" version)"
@@ -64,5 +72,6 @@ cat <<'EOF'
  10. portman ip            查看 IPv4 / IPv6 状态
  11. portman ipv6 off/on   关闭 / 开启 IPv6，重启后保持
  12. portman ssh           SSH 密钥登录：写入公钥、只允许密钥登录、查看状态
- 13. portman help          查看全部命令和用法示例
+ 13. portman route         默认上海三网回程检测，支持 MTR / 详细报告 / 保存文件
+ 14. portman help          查看全部命令和用法示例
 EOF
