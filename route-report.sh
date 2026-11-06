@@ -152,7 +152,7 @@ route_json_valid() {
 
 # 打印中文逐跳，汇总仅使用实际可见的路径信号；不将中间跳 ICMP 丢包视为业务丢包。
 route_render() {
-    local file=$1 city=$2 isp=$3 ip=$4 detail=$5 mtr=$6
+    local file=$1 city=$2 isp=$3 ip=$4 detail=$5 mtr=$6 summary_file=${7:--}
     local c cn reached reason endhop resolved rows first_hop=0
     local ttl hopip asn avg received loss stdev country prov loc owner label sig
     local last_sig="" path="" seen_cn2=0 seen_9929=0 seen_4837=0 seen_cmin2=0 seen_cmi=0 seen_163=0
@@ -223,6 +223,9 @@ route_render() {
     printf '  终点: %s  ·  抵达跳数: %s' "$endavg" "${endhop:-0}"
     [[ $mtr == 1 ]] && printf '  ·  终点丢包: %s  ·  延迟标准差: %s' "$endloss" "$endjitter"
     printf '\n'
+    if [[ $summary_file != '-' ]]; then
+        printf '%s%s | %s | %s | %s\n' "$(route_city_cn "$city")" "$cn" "$reached" "$endavg" "$summary" >> "$summary_file"
+    fi
     printf '  路径: %s\n' "${path:-无可识别跳点}"
     if [[ $mtr == 1 ]]; then
         printf '  注: 中间跳丢包可能是 ICMP 限速；重点看最终目标丢包。\n'
@@ -233,7 +236,7 @@ route_render() {
 }
 
 route_probe_one() {
-    local city=$1 isp=$2 ip=$3 detail=$4 mtr=$5 outputdir=$6
+    local city=$1 isp=$2 ip=$3 detail=$4 mtr=$5 outputdir=$6 summary_file=${7:--}
     local raw err count=3 code=0
     [[ $mtr == 1 ]] && count=20
     raw=$(mktemp) || return 1
@@ -245,6 +248,9 @@ route_probe_one() {
         nexttrace -r --json --language cn --no-rdns -q "$count" "$ip" > "$raw" 2>"$err" || code=$?
     fi
     if ! route_json_valid "$raw"; then
+        if [[ $summary_file != '-' ]]; then
+            printf '%s%s | 失败 | — | NextTrace 未输出有效 JSON\n' "$(route_city_cn "$city")" "$(route_isp_cn "$isp")" >> "$summary_file"
+        fi
         route_err "$(route_city_cn "$city")$(route_isp_cn "$isp") 检测失败 (退出码 $code)"
         [[ -s $err ]] && sed -n '1,5p' "$err" >&2
         [[ -s $raw ]] && sed -n '1,3p' "$raw" >&2
@@ -254,14 +260,15 @@ route_probe_one() {
     if [[ $outputdir != '-' ]]; then
         cp "$raw" "$outputdir/${city}-${isp}.json"
     fi
-    route_render "$raw" "$city" "$isp" "$ip" "$detail" "$mtr"
+    route_render "$raw" "$city" "$isp" "$ip" "$detail" "$mtr" "$summary_file"
     rm -f "$raw" "$err"
     [[ $code == 0 ]]
 }
 
 route_run_inner() {
     local city=$1 isp=$2 detail=$3 mtr=$4 outputdir=$5
-    local carriers=() current ip failures=0
+    local carriers=() current ip failures=0 summary_file
+    summary_file=$(mktemp) || return 1
     [[ $isp == all ]] && carriers=(telecom unicom mobile) || carriers=("$isp")
     printf '============================================\n'
     printf '   %s三网回程检测  |  NextTrace MTR JSON\n' "$(route_city_cn "$city")"
@@ -270,13 +277,18 @@ route_run_inner() {
     for current in "${carriers[@]}"; do
         ip=$(route_target "$city" "$current") || ip=""
         if [[ -z $ip ]]; then
+            printf '%s%s | 未测试 | — | 未配置目标地址\n' "$(route_city_cn "$city")" "$(route_isp_cn "$current")" >> "$summary_file"
             route_err "$(route_city_cn "$city")$(route_isp_cn "$current") 缺少已核实目标。使用 portman route set $city $current <IP> 配置"
             failures=$((failures+1))
             continue
         fi
-        route_probe_one "$city" "$current" "$ip" "$detail" "$mtr" "$outputdir" || failures=$((failures+1))
+        route_probe_one "$city" "$current" "$ip" "$detail" "$mtr" "$outputdir" "$summary_file" || failures=$((failures+1))
     done
     echo
+    printf '=============== 本次路由汇总 ===============\n'
+    cat "$summary_file"
+    printf '============================================\n'
+    rm -f "$summary_file"
     route_note "本次测试结束：$((${#carriers[@]}-failures))/${#carriers[@]} 个目标产生有效报告。"
     route_note '线路标签代表经过该骨干，不代表全程专线；单次 ICMP 不等于晚高峰真实业务质量。'
     route_note 'VPS 上仅能直接测回程；去程必须由中国境内的测点发起。'
